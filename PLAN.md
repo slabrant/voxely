@@ -48,8 +48,8 @@ Voxely aims to be a fast, lightweight, and modern voxel modeling tool that runs 
 
 A modular design keeps the editor maintainable and testable:
 
-- **`core`** — voxel data structures (volumes, chunks), the color palette, and edit operations. Pure logic, no rendering.
-- **`render`** — turns voxel volumes into meshes and draws them via the GPU.
+- **`core`** — voxel data structures (chunks, sparse structures like SVOs), the color palette, and edit operations. Pure logic, no rendering.
+- **`render`** — turns voxel volumes into optimized meshes (e.g., via **Greedy Meshing**) and draws them via the GPU.
 - **`editor`** — tools, selection, undo/redo command stack, camera control.
 - **`ui`** — windows, panels, toolbars, and palette widgets.
 - **`io`** — project save/load and external formats.
@@ -69,15 +69,18 @@ A modular design keeps the editor maintainable and testable:
 | `.vox` format support | `dot_vox` |
 | Mesh export (`.obj`) | custom writer or `obj` crates |
 | Logging | `log` + `env_logger` |
+| Parallelism | `rayon` (for meshing/heavy logic) |
+| Debian Packaging | `cargo-deb` |
 
 ---
 
 ## 6. Initial Milestones
 
-1. **Window + viewport** — open a window, render a single colored voxel cube.
-2. **Voxel grid + camera** — orbiting camera around an editable voxel volume.
-3. **Place/remove voxels** — basic mouse interaction with the grid.
-4. **Palette + coloring** — assign colors to voxels.
-5. **Save/Load** — native project format.
-6. **Import/Export** — `.vox` and `.obj` support.
-7. **Polish** — undo/redo, tools, UI panels, Debian packaging.
+1. **Window + viewport** — open a window, render a single colored voxel cube via `wgpu`.
+2. **Voxel grid + camera** — orbiting camera around a chunked voxel volume.
+3. **Meshing engine** — implement greedy meshing for efficient rendering.
+4. **Place/remove voxels** — basic mouse interaction with the grid; incremental mesh updates.
+5. **Palette + coloring** — assign colors to voxels.
+6. **Save/Load** — native project format.
+7. **Import/Export** — `.vox` and `.obj` support.
+8. **Polish** — undo/redo, 3D transformation gizmos, UI panels, Debian packaging.
