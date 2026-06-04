@@ -10,8 +10,18 @@ mod camera;
 pub mod core;
 pub mod render;
 
-pub async fn run() {
+    pub async fn run() {
     env_logger::init();
+    
+    println!("--- Voxely Quick Start ---");
+    println!("Orbit: Right-Click + Drag");
+    println!("Pan: Middle-Click + Drag");
+    println!("Zoom: Scroll Wheel");
+    println!("Place Voxel: Left-Click");
+    println!("Change Color: 1, 2, 3, 4");
+    println!("Save: S | Load: L | Import MagicaVoxel: I");
+    println!("--------------------------");
+
     let event_loop = EventLoop::new().unwrap();
     let window = Arc::new(WindowBuilder::new().build(&event_loop).unwrap());
 

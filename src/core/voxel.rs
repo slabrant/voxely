@@ -1,4 +1,6 @@
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+use serde::{Serialize, Deserialize};
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Voxel {
     pub color_index: u8,
 }

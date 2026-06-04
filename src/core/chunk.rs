@@ -1,16 +1,18 @@
 use super::Voxel;
+use serde::{Serialize, Deserialize};
 
 pub const CHUNK_SIZE: usize = 16;
 pub const CHUNK_SIZE_CUBED: usize = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
 
+#[derive(Serialize, Deserialize)]
 pub struct Chunk {
-    pub voxels: Box<[Voxel; CHUNK_SIZE_CUBED]>,
+    pub voxels: Vec<Voxel>,
 }
 
 impl Chunk {
     pub fn new() -> Self {
         Self {
-            voxels: Box::new([Voxel::default(); CHUNK_SIZE_CUBED]),
+            voxels: vec![Voxel::default(); CHUNK_SIZE_CUBED],
         }
     }
 

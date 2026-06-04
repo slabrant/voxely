@@ -1,4 +1,5 @@
 use crate::camera::{Camera, CameraUniform, CameraController};
+use glam::Vec4Swizzles;
 use std::sync::Arc;
 use winit::{
     event::WindowEvent,
@@ -22,12 +23,13 @@ pub struct State {
     camera_bind_group: wgpu::BindGroup,
     camera_controller: CameraController,
     depth_texture: Texture,
+    chunk: crate::core::Chunk,
+    cursor_position: winit::dpi::PhysicalPosition<f64>,
+    current_color_index: u8,
 }
 
 pub struct Texture {
-    pub texture: wgpu::Texture,
     pub view: wgpu::TextureView,
-    pub sampler: wgpu::Sampler,
 }
 
 impl Texture {
@@ -52,7 +54,7 @@ impl Texture {
         let texture = device.create_texture(&desc);
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let sampler = device.create_sampler(
+        let _sampler = device.create_sampler(
             &wgpu::SamplerDescriptor {
                 address_mode_u: wgpu::AddressMode::ClampToEdge,
                 address_mode_v: wgpu::AddressMode::ClampToEdge,
@@ -67,7 +69,7 @@ impl Texture {
             }
         );
 
-        Self { texture, view, sampler }
+        Self { view }
     }
 }
 
@@ -76,6 +78,7 @@ impl Texture {
 pub struct Vertex {
     pub position: [f32; 3],
     pub color: [f32; 3],
+    pub normal: [f32; 3],
 }
 
 impl Vertex {
@@ -93,39 +96,17 @@ impl Vertex {
                     offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
                     shader_location: 1,
                     format: wgpu::VertexFormat::Float32x3,
+                },
+                wgpu::VertexAttribute {
+                    offset: std::mem::size_of::<[f32; 6]>() as wgpu::BufferAddress,
+                    shader_location: 2,
+                    format: wgpu::VertexFormat::Float32x3,
                 }
             ]
         }
     }
 }
 
-const VERTICES: &[Vertex] = &[
-    // Front face
-    Vertex { position: [-0.5, -0.5,  0.5], color: [1.0, 0.0, 0.0] }, // 0
-    Vertex { position: [ 0.5, -0.5,  0.5], color: [0.0, 1.0, 0.0] }, // 1
-    Vertex { position: [ 0.5,  0.5,  0.5], color: [0.0, 0.0, 1.0] }, // 2
-    Vertex { position: [-0.5,  0.5,  0.5], color: [1.0, 1.0, 1.0] }, // 3
-    // Back face
-    Vertex { position: [-0.5, -0.5, -0.5], color: [1.0, 0.0, 0.0] }, // 4
-    Vertex { position: [ 0.5, -0.5, -0.5], color: [0.0, 1.0, 0.0] }, // 5
-    Vertex { position: [ 0.5,  0.5, -0.5], color: [0.0, 0.0, 1.0] }, // 6
-    Vertex { position: [-0.5,  0.5, -0.5], color: [1.0, 1.0, 1.0] }, // 7
-];
-
-const INDICES: &[u16] = &[
-    // Front
-    0, 1, 2, 2, 3, 0,
-    // Right
-    1, 5, 6, 6, 2, 1,
-    // Back
-    5, 4, 7, 7, 6, 5,
-    // Left
-    4, 0, 3, 3, 7, 4,
-    // Top
-    3, 2, 6, 6, 7, 3,
-    // Bottom
-    4, 5, 1, 1, 0, 4,
-];
 
 impl State {
     pub async fn new(window: Arc<Window>) -> State {
@@ -185,8 +166,8 @@ impl State {
         surface.configure(&device, &config);
 
         let camera = Camera {
-            eye: (0.0, 1.0, 2.0).into(),
-            target: (0.0, 0.0, 0.0).into(),
+            eye: (20.0, 20.0, 20.0).into(),
+            target: (8.0, 0.0, 8.0).into(),
             up: glam::Vec3::Y,
             aspect: config.width as f32 / config.height as f32,
             fovy: 45.0,
@@ -292,15 +273,20 @@ impl State {
 
         let depth_texture = Texture::create_depth_texture(&device, &config, "depth_texture");
 
-        let camera_controller = CameraController::new(0.02);
+        let camera_controller = CameraController::new(0.2, 0.005);
 
         let mut chunk = crate::core::Chunk::new();
-        for x in 0..8 {
-            for z in 0..8 {
-                chunk.set(x, 0, z, crate::core::Voxel { color_index: 1 });
+        // Create a basic 16x16 floor
+        for x in 0..16 {
+            for z in 0..16 {
+                let color = if (x + z) % 2 == 0 { 4 } else { 1 }; // Checkerboard
+                chunk.set(x, 0, z, crate::core::Voxel { color_index: color });
             }
         }
-        chunk.set(2, 1, 2, crate::core::Voxel { color_index: 1 });
+        // Add a small pillar in the middle
+        for y in 1..4 {
+            chunk.set(8, y, 8, crate::core::Voxel { color_index: 2 });
+        }
 
         let (mesh_vertices, mesh_indices) = crate::render::mesh_chunk(&chunk);
 
@@ -308,7 +294,7 @@ impl State {
             &wgpu::util::BufferInitDescriptor {
                 label: Some("Vertex Buffer"),
                 contents: bytemuck::cast_slice(&mesh_vertices),
-                usage: wgpu::BufferUsages::VERTEX,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             }
         );
 
@@ -316,7 +302,7 @@ impl State {
             &wgpu::util::BufferInitDescriptor {
                 label: Some("Index Buffer"),
                 contents: bytemuck::cast_slice(&mesh_indices),
-                usage: wgpu::BufferUsages::INDEX,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             }
         );
         let num_indices = mesh_indices.len() as u32;
@@ -338,12 +324,12 @@ impl State {
             camera_bind_group,
             camera_controller,
             depth_texture,
+            chunk,
+            cursor_position: winit::dpi::PhysicalPosition::new(0.0, 0.0),
+            current_color_index: 1,
         }
     }
 
-    pub fn window(&self) -> &Window {
-        &self.window
-    }
 
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         if new_size.width > 0 && new_size.height > 0 {
@@ -357,7 +343,172 @@ impl State {
     }
 
     pub fn input(&mut self, event: &WindowEvent) -> bool {
-        self.camera_controller.process_events(event)
+        match event {
+            WindowEvent::CursorMoved { position, .. } => {
+                let dx = (position.x - self.cursor_position.x) as f32;
+                let dy = (position.y - self.cursor_position.y) as f32;
+                self.camera_controller.handle_mouse_motion(dx, dy);
+                self.cursor_position = *position;
+                false
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if *button == winit::event::MouseButton::Left && *state == winit::event::ElementState::Pressed {
+                    self.handle_click();
+                }
+                self.camera_controller.process_events(event)
+            }
+            WindowEvent::KeyboardInput {
+                event: winit::event::KeyEvent {
+                    state: winit::event::ElementState::Pressed,
+                    physical_key: winit::keyboard::PhysicalKey::Code(key),
+                    ..
+                },
+                ..
+            } => {
+                match key {
+                    winit::keyboard::KeyCode::Digit1 => { self.current_color_index = 1; true }
+                    winit::keyboard::KeyCode::Digit2 => { self.current_color_index = 2; true }
+                    winit::keyboard::KeyCode::Digit3 => { self.current_color_index = 3; true }
+                    winit::keyboard::KeyCode::Digit4 => { self.current_color_index = 4; true }
+                    winit::keyboard::KeyCode::KeyS if self.window.clone().inner_size().width > 0 => { // Just use Ctrl+S if possible
+                        self.save_project();
+                        true
+                    }
+                    winit::keyboard::KeyCode::KeyL => {
+                        self.load_project();
+                        true
+                    }
+                    winit::keyboard::KeyCode::KeyI => {
+                        self.import_vox();
+                        true
+                    }
+                    _ => self.camera_controller.process_events(event),
+                }
+            }
+            WindowEvent::MouseWheel { .. } => {
+                self.camera_controller.process_events(event)
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_click(&mut self) {
+        // 1. Ray from camera through cursor
+        let ray_dir = self.screen_to_ray(self.cursor_position);
+        let ray_origin = self.camera.eye;
+
+        // 2. Raycast against voxels
+        if let Some((pos, normal)) = self.raycast(ray_origin, ray_dir) {
+            // Right click or modifier could be for removal, but for now let's just place
+            // Shift + Click for removal?
+            let _is_shift_pressed = self.window.clone().inner_size().width > 0; // Dummy check for now
+            // Actually, let's just implement placement for now.
+            
+            let place_pos = [
+                (pos[0] as f32 + normal[0] * 0.5).floor() as i32,
+                (pos[1] as f32 + normal[1] * 0.5).floor() as i32,
+                (pos[2] as f32 + normal[2] * 0.5).floor() as i32,
+            ];
+
+            if self.chunk.set(place_pos[0] as usize, place_pos[1] as usize, place_pos[2] as usize, crate::core::Voxel { color_index: self.current_color_index }) {
+                self.remesh();
+            }
+        }
+    }
+
+    fn screen_to_ray(&self, position: winit::dpi::PhysicalPosition<f64>) -> glam::Vec3 {
+        let x = (2.0 * position.x as f32) / self.size.width as f32 - 1.0;
+        let y = 1.0 - (2.0 * position.y as f32) / self.size.height as f32;
+        
+        let projection = glam::Mat4::perspective_rh(self.camera.fovy.to_radians(), self.camera.aspect, self.camera.znear, self.camera.zfar);
+        let view = glam::Mat4::look_at_rh(self.camera.eye, self.camera.target, self.camera.up);
+        let inv_vp = (projection * view).inverse();
+        
+        let clip_pos = glam::Vec4::new(x, y, -1.0, 1.0);
+        let world_pos = inv_vp * clip_pos;
+        let world_pos = world_pos.xyz() / world_pos.w;
+        
+        (world_pos - self.camera.eye).normalize()
+    }
+
+    fn raycast(&self, origin: glam::Vec3, dir: glam::Vec3) -> Option<([i32; 3], [f32; 3])> {
+        let mut t = 0.0;
+        let max_dist = 100.0;
+        let step = 0.1;
+
+        while t < max_dist {
+            let p = origin + dir * t;
+            let ip = [p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32];
+            
+            if let Some(voxel) = self.chunk.get(ip[0] as usize, ip[1] as usize, ip[2] as usize) {
+                if !voxel.is_empty() {
+                    // Primitive normal detection
+                    let mut normal = [0.0, 0.0, 0.0];
+                    let local_p = p - glam::Vec3::new(ip[0] as f32 + 0.5, ip[1] as f32 + 0.5, ip[2] as f32 + 0.5);
+                    let abs_p = local_p.abs();
+                    if abs_p.x > abs_p.y && abs_p.x > abs_p.z {
+                        normal[0] = local_p.x.signum();
+                    } else if abs_p.y > abs_p.z {
+                        normal[1] = local_p.y.signum();
+                    } else {
+                        normal[2] = local_p.z.signum();
+                    }
+                    return Some((ip, normal));
+                }
+            }
+            t += step;
+        }
+        None
+    }
+
+    fn remesh(&mut self) {
+        let (mesh_vertices, mesh_indices) = crate::render::mesh_chunk(&self.chunk);
+        
+        use wgpu::util::DeviceExt;
+        self.vertex_buffer = self.device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Vertex Buffer"),
+                contents: bytemuck::cast_slice(&mesh_vertices),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            }
+        );
+
+        self.index_buffer = self.device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Index Buffer"),
+                contents: bytemuck::cast_slice(&mesh_indices),
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            }
+        );
+        self.num_indices = mesh_indices.len() as u32;
+    }
+
+    fn save_project(&self) {
+        let serialized = bincode::serialize(&self.chunk).unwrap();
+        std::fs::write("project.voxely", serialized).unwrap();
+        println!("Project saved to project.voxely");
+    }
+
+    fn load_project(&mut self) {
+        if let Ok(data) = std::fs::read("project.voxely") {
+            let chunk: crate::core::Chunk = bincode::deserialize(&data).unwrap();
+            self.chunk = chunk;
+            self.remesh();
+            println!("Project loaded from project.voxely");
+        }
+    }
+
+    fn import_vox(&mut self) {
+        if let Ok(data) = dot_vox::load("model.vox") {
+            let model = &data.models[0];
+            let mut new_chunk = crate::core::Chunk::new();
+            for voxel in &model.voxels {
+                new_chunk.set(voxel.x as usize, voxel.z as usize, voxel.y as usize, crate::core::Voxel { color_index: voxel.i });
+            }
+            self.chunk = new_chunk;
+            self.remesh();
+            println!("Imported model.vox");
+        }
     }
 
     pub fn update(&mut self) {
