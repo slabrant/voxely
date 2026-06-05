@@ -256,7 +256,12 @@ impl State {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
+                // Voxel models are closed and opaque, so we draw every face and
+                // let the depth buffer decide what's visible. This avoids any
+                // "inside-out" gaps from face-winding mismatches in the mesher,
+                // at the cost of a little overdraw. Lighting stays correct
+                // because each face carries its true outward normal.
+                cull_mode: None,
                 // Setting this to anything other than Fill requires Features::NON_FILL_POLYGON_MODE
                 polygon_mode: wgpu::PolygonMode::Fill,
                 // Requires Features::DEPTH_CLIP_CONTROL

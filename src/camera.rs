@@ -163,13 +163,13 @@ impl CameraController {
         if self.is_right_pressed {
             let orbit_radius = forward_mag;
             let relative_eye = camera.eye - camera.target;
-            let rotated_eye = glam::Quat::from_axis_angle(camera.up, -self.speed * 0.5) * relative_eye;
+            let rotated_eye = glam::Quat::from_axis_angle(camera.up, self.speed * 0.5) * relative_eye;
             camera.eye = camera.target + rotated_eye.normalize() * orbit_radius;
         }
         if self.is_left_pressed {
             let orbit_radius = forward_mag;
             let relative_eye = camera.eye - camera.target;
-            let rotated_eye = glam::Quat::from_axis_angle(camera.up, self.speed * 0.5) * relative_eye;
+            let rotated_eye = glam::Quat::from_axis_angle(camera.up, -self.speed * 0.5) * relative_eye;
             camera.eye = camera.target + rotated_eye.normalize() * orbit_radius;
         }
 
@@ -178,8 +178,8 @@ impl CameraController {
             let orbit_radius = forward_mag;
             let relative_eye = camera.eye - camera.target;
             
-            // Horizontal rotation
-            let rot_x = glam::Quat::from_axis_angle(camera.up, -self.mouse_delta.0 * self.sensitivity);
+            // Horizontal rotation (drag right -> orbit right around the target)
+            let rot_x = glam::Quat::from_axis_angle(camera.up, self.mouse_delta.0 * self.sensitivity);
             let relative_eye = rot_x * relative_eye;
             
             // Vertical rotation
