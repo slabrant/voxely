@@ -1,6 +1,16 @@
 use glam::{Mat4, Vec3};
 use winit::event::*;
 
+// ── Camera tuning ───────────────────────────────────────────────────────────
+// Everything that controls how the camera "feels" lives here — this is the one
+// place to tweak. Larger values = faster motion.
+/// Orbit speed: radians of rotation per pixel of right-drag.
+const ORBIT_SENSITIVITY: f32 = 0.005;
+/// Pan speed: fraction of the distance-to-target moved per pixel of middle-drag.
+const PAN_SENSITIVITY: f32 = 0.0006;
+/// Zoom speed: distance moved toward the target per unit of scroll-wheel delta.
+const ZOOM_SENSITIVITY: f32 = 2.0;
+
 pub struct Camera {
     pub eye: Vec3,
     pub target: Vec3,
@@ -37,9 +47,8 @@ impl CameraUniform {
     }
 }
 
+#[derive(Default)]
 pub struct CameraController {
-    speed: f32,
-    sensitivity: f32,
     is_right_mouse_pressed: bool,
     is_middle_mouse_pressed: bool,
     mouse_delta: (f32, f32),
@@ -47,15 +56,8 @@ pub struct CameraController {
 }
 
 impl CameraController {
-    pub fn new(speed: f32, sensitivity: f32) -> Self {
-        Self {
-            speed,
-            sensitivity,
-            is_right_mouse_pressed: false,
-            is_middle_mouse_pressed: false,
-            mouse_delta: (0.0, 0.0),
-            scroll_delta: 0.0,
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn process_events(&mut self, event: &WindowEvent) -> bool {
@@ -102,7 +104,7 @@ impl CameraController {
             let forward = camera.target - camera.eye;
             let forward_mag = forward.length();
             let forward_norm = forward / forward_mag;
-            let zoom_amount = self.scroll_delta * self.speed * 10.0;
+            let zoom_amount = self.scroll_delta * ZOOM_SENSITIVITY;
             if forward_mag > zoom_amount {
                 camera.eye += forward_norm * zoom_amount;
             }
@@ -118,8 +120,8 @@ impl CameraController {
             let mut yaw = relative.z.atan2(relative.x);
             let mut pitch = (relative.y / radius).asin();
 
-            yaw -= self.mouse_delta.0 * self.sensitivity;
-            pitch += self.mouse_delta.1 * self.sensitivity;
+            yaw += self.mouse_delta.0 * ORBIT_SENSITIVITY;
+            pitch += self.mouse_delta.1 * ORBIT_SENSITIVITY;
 
             let limit = std::f32::consts::FRAC_PI_2 - 0.01;
             pitch = pitch.clamp(-limit, limit);
@@ -139,8 +141,10 @@ impl CameraController {
             let forward_norm = forward / forward_mag;
             let right = forward_norm.cross(camera.up);
             let up = right.cross(forward_norm);
-            let pan = right * self.mouse_delta.0 * self.sensitivity * forward_mag * 0.5
-                + up * self.mouse_delta.1 * self.sensitivity * forward_mag * 0.5;
+            // "Grab the world": the scene follows the cursor, so the camera
+            // moves opposite the horizontal drag (drag left -> camera goes right).
+            let pan = right * -self.mouse_delta.0 * PAN_SENSITIVITY * forward_mag
+                + up * self.mouse_delta.1 * PAN_SENSITIVITY * forward_mag;
             camera.eye += pan;
             camera.target += pan;
         }

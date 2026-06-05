@@ -290,7 +290,7 @@ impl State {
 
         let depth_texture = Texture::create_depth_texture(&device, &config, "depth_texture");
 
-        let camera_controller = CameraController::new(0.2, 0.005);
+        let camera_controller = CameraController::new();
 
         // egui: immediate-mode UI overlaid on top of the scene.
         let egui_ctx = egui::Context::default();
