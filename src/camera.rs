@@ -7,6 +7,7 @@ use winit::event::*;
 /// Orbit speed: radians of rotation per pixel of right-drag.
 const ORBIT_SENSITIVITY: f32 = 0.005;
 /// Pan speed: fraction of the distance-to-target moved per pixel of middle-drag.
+/// Now angle-independent, so this is set to match the old ~45-degree feel.
 const PAN_SENSITIVITY: f32 = 0.0006;
 /// Zoom speed: distance moved toward the target per unit of scroll-wheel delta.
 const ZOOM_SENSITIVITY: f32 = 2.0;
@@ -139,7 +140,10 @@ impl CameraController {
             let forward = camera.target - camera.eye;
             let forward_mag = forward.length();
             let forward_norm = forward / forward_mag;
-            let right = forward_norm.cross(camera.up);
+            // Normalize the basis so pan speed depends only on distance, not on
+            // the view angle. (`forward x up` has length sin(angle-to-vertical),
+            // which would make panning crawl top-down and race from the side.)
+            let right = forward_norm.cross(camera.up).normalize();
             let up = right.cross(forward_norm);
             // "Grab the world": the scene follows the cursor, so the camera
             // moves opposite the horizontal drag (drag left -> camera goes right).
