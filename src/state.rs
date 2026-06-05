@@ -19,6 +19,7 @@ pub struct State {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     pub size: winit::dpi::PhysicalSize<u32>,
+    window: Arc<Window>,
     render_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
@@ -35,6 +36,9 @@ pub struct State {
     cursor_position: winit::dpi::PhysicalPosition<f64>,
     current_color_index: u8,
     modifiers: ModifiersState,
+    egui_ctx: egui::Context,
+    egui_state: egui_winit::State,
+    egui_renderer: egui_wgpu::Renderer,
 }
 
 pub struct Texture {
@@ -288,6 +292,17 @@ impl State {
 
         let camera_controller = CameraController::new(0.2, 0.005);
 
+        // egui: immediate-mode UI overlaid on top of the scene.
+        let egui_ctx = egui::Context::default();
+        let egui_state = egui_winit::State::new(
+            egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            window.as_ref(),
+            Some(window.scale_factor() as f32),
+            Some(device.limits().max_texture_dimension_2d as usize),
+        );
+        let egui_renderer = egui_wgpu::Renderer::new(&device, config.format, None, 1);
+
         let palette = Palette::default();
 
         let mut chunk = crate::core::Chunk::new();
@@ -323,6 +338,7 @@ impl State {
         let num_indices = mesh_indices.len() as u32;
 
         Self {
+            window,
             surface,
             device,
             queue,
@@ -344,6 +360,9 @@ impl State {
             cursor_position: winit::dpi::PhysicalPosition::new(0.0, 0.0),
             current_color_index: 1,
             modifiers: ModifiersState::empty(),
+            egui_ctx,
+            egui_state,
+            egui_renderer,
         }
     }
 
@@ -360,6 +379,11 @@ impl State {
     }
 
     pub fn input(&mut self, event: &WindowEvent) -> bool {
+        // Let egui handle the event first; if it's consumed (e.g. a click on a
+        // panel), don't also treat it as a scene/camera interaction.
+        if self.egui_state.on_window_event(&self.window, event).consumed {
+            return true;
+        }
         match event {
             WindowEvent::CursorMoved { position, .. } => {
                 let dx = (position.x - self.cursor_position.x) as f32;
@@ -591,6 +615,19 @@ impl State {
     }
 
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        // Run the UI first so button actions (undo/redo, recolor) apply to the
+        // mesh on this same frame. `egui_ctx` is a cheap clone-able handle, so
+        // cloning it lets the closure borrow `self` mutably without aliasing.
+        let raw_input = self.egui_state.take_egui_input(&self.window);
+        let egui_ctx = self.egui_ctx.clone();
+        let full_output = egui_ctx.run(raw_input, |ctx| {
+            self.build_ui(ctx);
+        });
+        self.egui_state
+            .handle_platform_output(&self.window, full_output.platform_output);
+        let paint_jobs =
+            egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+
         let output = self.surface.get_current_texture()?;
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
@@ -598,6 +635,23 @@ impl State {
             label: Some("Render Encoder"),
         });
 
+        let screen_descriptor = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.config.width, self.config.height],
+            pixels_per_point: full_output.pixels_per_point,
+        };
+        for (id, image_delta) in &full_output.textures_delta.set {
+            self.egui_renderer
+                .update_texture(&self.device, &self.queue, *id, image_delta);
+        }
+        let user_buffers = self.egui_renderer.update_buffers(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &paint_jobs,
+            &screen_descriptor,
+        );
+
+        // Scene pass: clears the frame and draws the voxel mesh.
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
@@ -633,9 +687,128 @@ impl State {
             render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
         }
 
-        self.queue.submit(std::iter::once(encoder.finish()));
+        // UI pass: draws egui on top, preserving the scene (LoadOp::Load).
+        {
+            let mut egui_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("egui Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+            self.egui_renderer
+                .render(&mut egui_pass, &paint_jobs, &screen_descriptor);
+        }
+
+        for id in &full_output.textures_delta.free {
+            self.egui_renderer.free_texture(id);
+        }
+
+        self.queue
+            .submit(user_buffers.into_iter().chain(std::iter::once(encoder.finish())));
         output.present();
 
         Ok(())
+    }
+
+    fn build_ui(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("controls_panel")
+            .resizable(false)
+            .default_width(210.0)
+            .show(ctx, |ui| {
+                ui.heading("Voxely");
+                ui.separator();
+
+                ui.label("History");
+                ui.horizontal(|ui| {
+                    if ui.button("⟲ Undo").clicked() {
+                        self.undo();
+                    }
+                    if ui.button("⟳ Redo").clicked() {
+                        self.redo();
+                    }
+                });
+
+                ui.add_space(6.0);
+                ui.label("File");
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        self.save_project();
+                    }
+                    if ui.button("Load").clicked() {
+                        self.load_project();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Import .vox").clicked() {
+                        self.import_vox();
+                    }
+                    if ui.button("Export .obj").clicked() {
+                        self.export_obj();
+                    }
+                });
+
+                ui.separator();
+                ui.label(format!("Active color: #{}", self.current_color_index));
+
+                // Recolor the selected palette slot; existing voxels of that
+                // color update immediately via a remesh.
+                let idx = self.current_color_index as usize;
+                let c = self.palette.colors[idx];
+                let mut rgb = [
+                    c[0] as f32 / 255.0,
+                    c[1] as f32 / 255.0,
+                    c[2] as f32 / 255.0,
+                ];
+                if ui.color_edit_button_rgb(&mut rgb).changed() {
+                    self.palette.colors[idx] = [
+                        (rgb[0] * 255.0).round() as u8,
+                        (rgb[1] * 255.0).round() as u8,
+                        (rgb[2] * 255.0).round() as u8,
+                        255,
+                    ];
+                    self.remesh();
+                }
+
+                ui.add_space(6.0);
+                ui.label("Palette (click to pick)");
+                ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
+                let cols = 8;
+                for row in 0..8 {
+                    ui.horizontal(|ui| {
+                        for col in 0..cols {
+                            let i = (row * cols + col + 1) as u8; // 1..=64
+                            let pc = self.palette.colors[i as usize];
+                            let swatch = egui::Color32::from_rgb(pc[0], pc[1], pc[2]);
+                            let (rect, resp) = ui
+                                .allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
+                            ui.painter().rect_filled(rect, 2.0, swatch);
+                            if i == self.current_color_index {
+                                ui.painter().rect_stroke(
+                                    rect,
+                                    2.0,
+                                    egui::Stroke::new(2.0, egui::Color32::WHITE),
+                                );
+                            }
+                            if resp.clicked() {
+                                self.current_color_index = i;
+                            }
+                        }
+                    });
+                }
+
+                ui.separator();
+                ui.label("Left-click: place");
+                ui.label("Shift + Left-click: remove");
+                ui.label("Right-drag: orbit");
+                ui.label("Middle-drag: pan · Scroll: zoom");
+            });
     }
 }

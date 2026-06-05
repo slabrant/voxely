@@ -1,6 +1,5 @@
 use glam::{Mat4, Vec3};
 use winit::event::*;
-use winit::keyboard::KeyCode;
 
 pub struct Camera {
     pub eye: Vec3,
@@ -41,10 +40,6 @@ impl CameraUniform {
 pub struct CameraController {
     speed: f32,
     sensitivity: f32,
-    is_forward_pressed: bool,
-    is_backward_pressed: bool,
-    is_left_pressed: bool,
-    is_right_pressed: bool,
     is_right_mouse_pressed: bool,
     is_middle_mouse_pressed: bool,
     mouse_delta: (f32, f32),
@@ -56,10 +51,6 @@ impl CameraController {
         Self {
             speed,
             sensitivity,
-            is_forward_pressed: false,
-            is_backward_pressed: false,
-            is_left_pressed: false,
-            is_right_pressed: false,
             is_right_mouse_pressed: false,
             is_middle_mouse_pressed: false,
             mouse_delta: (0.0, 0.0),
@@ -69,35 +60,6 @@ impl CameraController {
 
     pub fn process_events(&mut self, event: &WindowEvent) -> bool {
         match event {
-            WindowEvent::KeyboardInput {
-                event: KeyEvent {
-                    state,
-                    physical_key: winit::keyboard::PhysicalKey::Code(key),
-                    ..
-                },
-                ..
-            } => {
-                let is_pressed = *state == ElementState::Pressed;
-                match key {
-                    KeyCode::KeyW | KeyCode::ArrowUp => {
-                        self.is_forward_pressed = is_pressed;
-                        true
-                    }
-                    KeyCode::KeyA | KeyCode::ArrowLeft => {
-                        self.is_left_pressed = is_pressed;
-                        true
-                    }
-                    KeyCode::KeyS | KeyCode::ArrowDown => {
-                        self.is_backward_pressed = is_pressed;
-                        true
-                    }
-                    KeyCode::KeyD | KeyCode::ArrowRight => {
-                        self.is_right_pressed = is_pressed;
-                        true
-                    }
-                    _ => false,
-                }
-            }
             WindowEvent::MouseInput { state, button, .. } => {
                 let is_pressed = *state == ElementState::Pressed;
                 match button {
@@ -135,67 +97,52 @@ impl CameraController {
     }
 
     pub fn update_camera(&mut self, camera: &mut Camera) {
-        let forward = camera.target - camera.eye;
-        let forward_norm = forward.normalize();
-        let forward_mag = forward.length();
-
-        // Keyboard zoom
-        if self.is_forward_pressed && forward_mag > self.speed {
-            camera.eye += forward_norm * self.speed;
-        }
-        if self.is_backward_pressed {
-            camera.eye -= forward_norm * self.speed;
-        }
-
-        // Mouse zoom
+        // Mouse zoom (scroll): move the eye toward/away from the target.
         if self.scroll_delta.abs() > 0.0 {
+            let forward = camera.target - camera.eye;
+            let forward_mag = forward.length();
+            let forward_norm = forward / forward_mag;
             let zoom_amount = self.scroll_delta * self.speed * 10.0;
             if forward_mag > zoom_amount {
-                 camera.eye += forward_norm * zoom_amount;
+                camera.eye += forward_norm * zoom_amount;
             }
             self.scroll_delta = 0.0;
         }
 
-        let right = forward_norm.cross(camera.up);
-        let up = right.cross(forward_norm);
+        // Mouse orbit (right-drag): spherical orbit around the target. Yaw is
+        // around world-up and pitch is clamped just short of the poles, so the
+        // motion stays stable and can't flip the view upside-down.
+        if self.is_right_mouse_pressed && (self.mouse_delta.0 != 0.0 || self.mouse_delta.1 != 0.0) {
+            let relative = camera.eye - camera.target;
+            let radius = relative.length();
+            let mut yaw = relative.z.atan2(relative.x);
+            let mut pitch = (relative.y / radius).asin();
 
-        // Keyboard orbit
-        if self.is_right_pressed {
-            let orbit_radius = forward_mag;
-            let relative_eye = camera.eye - camera.target;
-            let rotated_eye = glam::Quat::from_axis_angle(camera.up, self.speed * 0.5) * relative_eye;
-            camera.eye = camera.target + rotated_eye.normalize() * orbit_radius;
-        }
-        if self.is_left_pressed {
-            let orbit_radius = forward_mag;
-            let relative_eye = camera.eye - camera.target;
-            let rotated_eye = glam::Quat::from_axis_angle(camera.up, -self.speed * 0.5) * relative_eye;
-            camera.eye = camera.target + rotated_eye.normalize() * orbit_radius;
-        }
+            yaw -= self.mouse_delta.0 * self.sensitivity;
+            pitch += self.mouse_delta.1 * self.sensitivity;
 
-        // Mouse Orbit
-        if self.is_right_mouse_pressed {
-            let orbit_radius = forward_mag;
-            let relative_eye = camera.eye - camera.target;
-            
-            // Horizontal rotation (drag right -> orbit right around the target)
-            let rot_x = glam::Quat::from_axis_angle(camera.up, self.mouse_delta.0 * self.sensitivity);
-            let relative_eye = rot_x * relative_eye;
-            
-            // Vertical rotation
-            let right = (camera.target - (camera.target + relative_eye)).normalize().cross(camera.up).normalize();
-            let rot_y = glam::Quat::from_axis_angle(right, -self.mouse_delta.1 * self.sensitivity);
-            let relative_eye = rot_y * relative_eye;
-            
-            camera.eye = camera.target + relative_eye.normalize() * orbit_radius;
+            let limit = std::f32::consts::FRAC_PI_2 - 0.01;
+            pitch = pitch.clamp(-limit, limit);
+
+            camera.eye = camera.target
+                + Vec3::new(
+                    radius * pitch.cos() * yaw.cos(),
+                    radius * pitch.sin(),
+                    radius * pitch.cos() * yaw.sin(),
+                );
         }
 
-        // Mouse Pan
+        // Mouse pan (middle-drag): slide both eye and target across the view plane.
         if self.is_middle_mouse_pressed {
-            let pan_x = right * self.mouse_delta.0 * self.sensitivity * forward_mag * 0.5;
-            let pan_y = up * self.mouse_delta.1 * self.sensitivity * forward_mag * 0.5;
-            camera.eye += pan_x + pan_y;
-            camera.target += pan_x + pan_y;
+            let forward = camera.target - camera.eye;
+            let forward_mag = forward.length();
+            let forward_norm = forward / forward_mag;
+            let right = forward_norm.cross(camera.up);
+            let up = right.cross(forward_norm);
+            let pan = right * self.mouse_delta.0 * self.sensitivity * forward_mag * 0.5
+                + up * self.mouse_delta.1 * self.sensitivity * forward_mag * 0.5;
+            camera.eye += pan;
+            camera.target += pan;
         }
 
         self.mouse_delta = (0.0, 0.0);
