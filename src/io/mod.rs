@@ -4,7 +4,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::chunk::CHUNK_SIZE;
+use crate::core::chunk::{CHUNK_WIDTH, CHUNK_HEIGHT, CHUNK_DEPTH};
 use crate::core::{Chunk, Palette, Voxel};
 
 /// Everything persisted in a native `.voxely` project file.
@@ -59,7 +59,7 @@ pub fn import_vox(path: impl AsRef<Path>) -> Result<Project, Box<dyn Error>> {
         }
     }
     if dropped > 0 {
-        log::warn!("{dropped} voxels were outside the {CHUNK_SIZE}^3 chunk and were dropped on import");
+        log::warn!("{dropped} voxels were outside the {CHUNK_WIDTH}x{CHUNK_HEIGHT}x{CHUNK_DEPTH} chunk and were dropped on import");
     }
 
     Ok(Project { chunk, palette })
@@ -100,9 +100,9 @@ pub fn export_obj(path: impl AsRef<Path>, chunk: &Chunk, palette: &Palette) -> R
     let mut vbase = 0u32;
     // Group by color so each material is referenced once and faces stay valid.
     let mut by_color: std::collections::BTreeMap<u8, Vec<(usize, usize, usize)>> = std::collections::BTreeMap::new();
-    for x in 0..CHUNK_SIZE {
-        for y in 0..CHUNK_SIZE {
-            for z in 0..CHUNK_SIZE {
+    for x in 0..CHUNK_WIDTH {
+        for y in 0..CHUNK_HEIGHT {
+            for z in 0..CHUNK_DEPTH {
                 if let Some(v) = chunk.get(x, y, z) {
                     if !v.is_empty() {
                         by_color.entry(v.color_index).or_default().push((x, y, z));

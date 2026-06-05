@@ -21,9 +21,12 @@ pub struct State {
     pub size: winit::dpi::PhysicalSize<u32>,
     window: Arc<Window>,
     render_pipeline: wgpu::RenderPipeline,
+    line_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
+    line_vertex_buffer: wgpu::Buffer,
     num_indices: u32,
+    num_line_indices: u32,
     camera: Camera,
     camera_uniform: CameraUniform,
     camera_buffer: wgpu::Buffer,
@@ -39,6 +42,12 @@ pub struct State {
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
+    is_left_mouse_pressed: bool,
+    last_action_time: std::time::Duration,
+    is_undo_pressed: bool,
+    is_redo_pressed: bool,
+    last_grid_coord: Option<[i32; 3]>,
+    drag_start_voxels: Vec<[i32; 3]>,
 }
 
 pub struct Texture {
@@ -260,22 +269,52 @@ impl State {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
-                // Voxel models are closed and opaque, so we draw every face and
-                // let the depth buffer decide what's visible. This avoids any
-                // "inside-out" gaps from face-winding mismatches in the mesher,
-                // at the cost of a little overdraw. Lighting stays correct
-                // because each face carries its true outward normal.
                 cull_mode: None,
-                // Setting this to anything other than Fill requires Features::NON_FILL_POLYGON_MODE
                 polygon_mode: wgpu::PolygonMode::Fill,
-                // Requires Features::DEPTH_CLIP_CONTROL
                 unclipped_depth: false,
-                // Requires Features::CONSERVATIVE_RASTERIZATION
                 conservative: false,
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: Texture::DEPTH_FORMAT,
                 depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+        });
+
+        let line_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Line Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[
+                    Vertex::desc(),
+                ],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_line",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: Texture::DEPTH_FORMAT,
+                depth_write_enabled: false,
                 depth_compare: wgpu::CompareFunction::Less,
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
@@ -305,18 +344,7 @@ impl State {
 
         let palette = Palette::default();
 
-        let mut chunk = crate::core::Chunk::new();
-        // Create a basic 16x16 floor
-        for x in 0..16 {
-            for z in 0..16 {
-                let color = if (x + z) % 2 == 0 { 4 } else { 1 }; // Checkerboard
-                chunk.set(x, 0, z, Voxel { color_index: color });
-            }
-        }
-        // Add a small pillar in the middle
-        for y in 1..4 {
-            chunk.set(8, y, 8, Voxel { color_index: 2 });
-        }
+        let chunk = crate::core::Chunk::new();
 
         let (mesh_vertices, mesh_indices) = crate::render::mesh_chunk(&chunk, &palette);
 
@@ -337,6 +365,49 @@ impl State {
         );
         let num_indices = mesh_indices.len() as u32;
 
+        use crate::core::chunk::{CHUNK_WIDTH, CHUNK_HEIGHT, CHUNK_DEPTH};
+        let w = CHUNK_WIDTH as f32;
+        let h = CHUNK_HEIGHT as f32;
+        let d = CHUNK_DEPTH as f32;
+        let line_vertices = [
+            // Bottom square
+            Vertex { position: [0.0, 0.0, 0.0], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
+            Vertex { position: [w, 0.0, 0.0], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
+            Vertex { position: [w, 0.0, 0.0], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
+            Vertex { position: [w, 0.0, d], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
+            Vertex { position: [w, 0.0, d], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
+            Vertex { position: [0.0, 0.0, d], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
+            Vertex { position: [0.0, 0.0, d], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
+            Vertex { position: [0.0, 0.0, 0.0], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
+            // Top square
+            Vertex { position: [0.0, h, 0.0], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
+            Vertex { position: [w, h, 0.0], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
+            Vertex { position: [w, h, 0.0], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
+            Vertex { position: [w, h, d], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
+            Vertex { position: [w, h, d], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
+            Vertex { position: [0.0, h, d], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
+            Vertex { position: [0.0, h, d], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
+            Vertex { position: [0.0, h, 0.0], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
+            // Pillars
+            Vertex { position: [0.0, 0.0, 0.0], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
+            Vertex { position: [0.0, h, 0.0], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
+            Vertex { position: [w, 0.0, 0.0], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
+            Vertex { position: [w, h, 0.0], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
+            Vertex { position: [w, 0.0, d], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
+            Vertex { position: [w, h, d], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
+            Vertex { position: [0.0, 0.0, d], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
+            Vertex { position: [0.0, h, d], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
+        ];
+        let num_line_indices = line_vertices.len() as u32;
+
+        let line_vertex_buffer = device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Line Vertex Buffer"),
+                contents: bytemuck::cast_slice(&line_vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            }
+        );
+
         Self {
             window,
             surface,
@@ -345,9 +416,12 @@ impl State {
             config,
             size,
             render_pipeline,
+            line_pipeline,
             vertex_buffer,
             index_buffer,
+            line_vertex_buffer,
             num_indices,
+            num_line_indices,
             camera,
             camera_uniform,
             camera_buffer,
@@ -363,6 +437,12 @@ impl State {
             egui_ctx,
             egui_state,
             egui_renderer,
+            is_left_mouse_pressed: false,
+            last_action_time: std::time::Duration::ZERO,
+            is_undo_pressed: false,
+            is_redo_pressed: false,
+            last_grid_coord: None,
+            drag_start_voxels: Vec::new(),
         }
     }
 
@@ -390,11 +470,21 @@ impl State {
                 let dy = (position.y - self.cursor_position.y) as f32;
                 self.camera_controller.handle_mouse_motion(dx, dy);
                 self.cursor_position = *position;
+                if self.is_left_mouse_pressed {
+                    self.handle_drag();
+                }
                 false
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                if *button == winit::event::MouseButton::Left && *state == winit::event::ElementState::Pressed {
-                    self.handle_click();
+                if *button == winit::event::MouseButton::Left {
+                    self.is_left_mouse_pressed = *state == winit::event::ElementState::Pressed;
+                    if self.is_left_mouse_pressed {
+                        self.drag_start_voxels.clear();
+                        self.handle_click();
+                    } else {
+                        self.last_grid_coord = None;
+                        self.drag_start_voxels.clear();
+                    }
                 }
                 self.camera_controller.process_events(event)
             }
@@ -413,24 +503,46 @@ impl State {
             } => {
                 use winit::keyboard::KeyCode;
                 let pressed = *state == winit::event::ElementState::Pressed;
-                if pressed && !*repeat {
-                    let ctrl = self.modifiers.control_key();
+                let ctrl = self.modifiers.control_key();
+
+                if pressed {
                     match key {
-                        KeyCode::Digit1 => { self.current_color_index = 1; return true; }
-                        KeyCode::Digit2 => { self.current_color_index = 2; return true; }
-                        KeyCode::Digit3 => { self.current_color_index = 3; return true; }
-                        KeyCode::Digit4 => { self.current_color_index = 4; return true; }
-                        KeyCode::Digit5 => { self.current_color_index = 5; return true; }
-                        KeyCode::Digit6 => { self.current_color_index = 6; return true; }
-                        KeyCode::Digit7 => { self.current_color_index = 7; return true; }
-                        KeyCode::Digit8 => { self.current_color_index = 8; return true; }
-                        KeyCode::Digit9 => { self.current_color_index = 9; return true; }
-                        KeyCode::KeyS if ctrl => { self.save_project(); return true; }
-                        KeyCode::KeyL if ctrl => { self.load_project(); return true; }
-                        KeyCode::KeyI if ctrl => { self.import_vox(); return true; }
-                        KeyCode::KeyE if ctrl => { self.export_obj(); return true; }
-                        KeyCode::KeyZ if ctrl => { self.undo(); return true; }
-                        KeyCode::KeyY if ctrl => { self.redo(); return true; }
+                        KeyCode::Digit1 if !*repeat => { self.current_color_index = 1; return true; }
+                        KeyCode::Digit2 if !*repeat => { self.current_color_index = 2; return true; }
+                        KeyCode::Digit3 if !*repeat => { self.current_color_index = 3; return true; }
+                        KeyCode::Digit4 if !*repeat => { self.current_color_index = 4; return true; }
+                        KeyCode::Digit5 if !*repeat => { self.current_color_index = 5; return true; }
+                        KeyCode::Digit6 if !*repeat => { self.current_color_index = 6; return true; }
+                        KeyCode::Digit7 if !*repeat => { self.current_color_index = 7; return true; }
+                        KeyCode::Digit8 if !*repeat => { self.current_color_index = 8; return true; }
+                        KeyCode::Digit9 if !*repeat => { self.current_color_index = 9; return true; }
+                        KeyCode::KeyS if ctrl && !*repeat => { self.save_project(); return true; }
+                        KeyCode::KeyL if ctrl && !*repeat => { self.load_project(); return true; }
+                        KeyCode::KeyI if ctrl && !*repeat => { self.import_vox(); return true; }
+                        KeyCode::KeyE if ctrl && !*repeat => { self.export_obj(); return true; }
+                        KeyCode::KeyZ if ctrl => {
+                            if !self.is_undo_pressed {
+                                self.undo();
+                                self.last_action_time = std::time::Duration::ZERO; // Initial undo immediate
+                                self.is_undo_pressed = true;
+                            }
+                            return true;
+                        }
+                        KeyCode::KeyY if ctrl => {
+                            if !self.is_redo_pressed {
+                                self.redo();
+                                self.last_action_time = std::time::Duration::ZERO; // Initial redo immediate
+                                self.is_redo_pressed = true;
+                            }
+                            return true;
+                        }
+                        _ => {}
+                    }
+                } else {
+                    // Released
+                    match key {
+                        KeyCode::KeyZ => self.is_undo_pressed = false,
+                        KeyCode::KeyY => self.is_redo_pressed = false,
                         _ => {}
                     }
                 }
@@ -449,25 +561,103 @@ impl State {
         let ray_dir = self.screen_to_ray(self.cursor_position);
         let ray_origin = self.camera.eye;
 
-        if let Some((pos, normal)) = self.raycast(ray_origin, ray_dir) {
-            if self.modifiers.shift_key() {
+        if let Some((pos, normal, is_drag_voxel)) = self.raycast(ray_origin, ray_dir) {
+            let coord = if self.modifiers.shift_key() {
                 // Remove the voxel that was hit.
-                self.set_voxel(pos[0], pos[1], pos[2], Voxel { color_index: 0 });
+                pos
+            } else if is_drag_voxel {
+                // If we hit a voxel from the same drag session, don't add the normal.
+                // This prevents stacking (staircases) while still allowing the voxel to block the ray.
+                pos
             } else {
                 // Place a new voxel against the hit face, one cell along the normal.
-                self.set_voxel(
+                [
                     pos[0] + normal[0] as i32,
                     pos[1] + normal[1] as i32,
                     pos[2] + normal[2] as i32,
-                    Voxel { color_index: self.current_color_index },
-                );
+                ]
+            };
+            if Some(coord) == self.last_grid_coord {
+                return;
+            }
+            let color_index = if self.modifiers.shift_key() { 0 } else { self.current_color_index };
+            if self.set_voxel(coord[0], coord[1], coord[2], Voxel { color_index }, false) {
+                self.last_grid_coord = Some(coord);
+            }
+        }
+    }
+
+    fn handle_drag(&mut self) {
+        let ray_dir = self.screen_to_ray(self.cursor_position);
+        let ray_origin = self.camera.eye;
+
+        if let Some((pos, normal, is_drag_voxel)) = self.raycast(ray_origin, ray_dir) {
+            let current_coord = if self.modifiers.shift_key() {
+                pos
+            } else if is_drag_voxel {
+                pos
+            } else {
+                [
+                    pos[0] + normal[0] as i32,
+                    pos[1] + normal[1] as i32,
+                    pos[2] + normal[2] as i32,
+                ]
+            };
+
+            if let Some(last_coord) = self.last_grid_coord {
+                if current_coord != last_coord {
+                    // 3D DDA Line Algorithm
+                    let x1 = last_coord[0] as f32;
+                    let y1 = last_coord[1] as f32;
+                    let z1 = last_coord[2] as f32;
+                    let x2 = current_coord[0] as f32;
+                    let y2 = current_coord[1] as f32;
+                    let z2 = current_coord[2] as f32;
+
+                    let dx = x2 - x1;
+                    let dy = y2 - y1;
+                    let dz = z2 - z1;
+
+                    let steps = dx.abs().max(dy.abs()).max(dz.abs());
+                    if steps > 0.0 {
+                        let x_inc = dx / steps;
+                        let y_inc = dy / steps;
+                        let z_inc = dz / steps;
+
+                        let mut cx = x1;
+                        let mut cy = y1;
+                        let mut cz = z1;
+
+                        for i in 0..=steps as i32 {
+                            let coord = [cx.round() as i32, cy.round() as i32, cz.round() as i32];
+                            // Skip the first coordinate if it's the one we just placed in handle_click
+                            // or the last one from handle_drag.
+                            if i == 0 && Some(coord) == self.last_grid_coord {
+                                cx += x_inc;
+                                cy += y_inc;
+                                cz += z_inc;
+                                continue;
+                            }
+                            let color_index = if self.modifiers.shift_key() { 0 } else { self.current_color_index };
+                            self.set_voxel(coord[0], coord[1], coord[2], Voxel { color_index }, true);
+                            cx += x_inc;
+                            cy += y_inc;
+                            cz += z_inc;
+                        }
+                    }
+                    self.last_grid_coord = Some(current_coord);
+                }
+            } else {
+                let color_index = if self.modifiers.shift_key() { 0 } else { self.current_color_index };
+                self.set_voxel(current_coord[0], current_coord[1], current_coord[2], Voxel { color_index }, false);
+                self.last_grid_coord = Some(current_coord);
             }
         }
     }
 
     /// Sets a voxel, recording the change for undo and re-meshing only if
     /// something actually changed. Coordinates outside the chunk are ignored.
-    fn set_voxel(&mut self, x: i32, y: i32, z: i32, voxel: Voxel) -> bool {
+    fn set_voxel(&mut self, x: i32, y: i32, z: i32, voxel: Voxel, is_drag: bool) -> bool {
         if x < 0 || y < 0 || z < 0 {
             return false;
         }
@@ -480,7 +670,17 @@ impl State {
             return false;
         }
         self.chunk.set(xu, yu, zu, voxel);
-        self.history.record(VoxelEdit { x: xu, y: yu, z: zu, old, new: voxel });
+
+        // Record voxels placed during this drag session to exclude them from raycasting
+        if self.is_left_mouse_pressed && !voxel.is_empty() {
+            self.drag_start_voxels.push([x, y, z]);
+        }
+
+        if is_drag {
+            self.history.record_continuous(VoxelEdit { x: xu, y: yu, z: zu, old, new: voxel });
+        } else {
+            self.history.record(VoxelEdit { x: xu, y: yu, z: zu, old, new: voxel });
+        }
         self.remesh();
         true
     }
@@ -516,7 +716,8 @@ impl State {
         (world_pos - self.camera.eye).normalize()
     }
 
-    fn raycast(&self, origin: glam::Vec3, dir: glam::Vec3) -> Option<([i32; 3], [f32; 3])> {
+    fn raycast(&self, origin: glam::Vec3, dir: glam::Vec3) -> Option<([i32; 3], [f32; 3], bool)> {
+        // First check for voxel hits
         let mut t = 0.0;
         let max_dist = 100.0;
         let step = 0.1;
@@ -527,8 +728,10 @@ impl State {
             
             if let Some(voxel) = self.chunk.get(ip[0] as usize, ip[1] as usize, ip[2] as usize) {
                 if !voxel.is_empty() {
+                    let is_drag_voxel = self.drag_start_voxels.contains(&ip);
+
                     // Primitive normal detection
-                    let mut normal = [0.0, 0.0, 0.0];
+                    let mut normal = [0.0; 3];
                     let local_p = p - glam::Vec3::new(ip[0] as f32 + 0.5, ip[1] as f32 + 0.5, ip[2] as f32 + 0.5);
                     let abs_p = local_p.abs();
                     if abs_p.x > abs_p.y && abs_p.x > abs_p.z {
@@ -538,12 +741,97 @@ impl State {
                     } else {
                         normal[2] = local_p.z.signum();
                     }
-                    return Some((ip, normal));
+                    return Some((ip, normal, is_drag_voxel));
                 }
             }
             t += step;
         }
-        None
+
+        // If no voxel was hit, check for intersection with the world's bounding box boundaries.
+        // This allows building from the limits when the world is empty.
+        use crate::core::chunk::{CHUNK_WIDTH, CHUNK_HEIGHT, CHUNK_DEPTH};
+        
+        let mut t_min = f32::NEG_INFINITY;
+        let mut t_max = f32::INFINITY;
+        let mut hit_normal_near = [0.0; 3];
+        let mut hit_normal_far = [0.0; 3];
+
+        let bounds_min = [0.0, 0.0, 0.0];
+        let bounds_max = [CHUNK_WIDTH as f32, CHUNK_HEIGHT as f32, CHUNK_DEPTH as f32];
+        let origin_arr = [origin.x, origin.y, origin.z];
+        let dir_arr = [dir.x, dir.y, dir.z];
+
+        for i in 0..3 {
+            if dir_arr[i].abs() > 1e-6 {
+                let t1 = (bounds_min[i] - origin_arr[i]) / dir_arr[i];
+                let t2 = (bounds_max[i] - origin_arr[i]) / dir_arr[i];
+
+                let (t_near, t_far, normal_near, normal_far) = if t1 < t2 { 
+                    (t1, t2, -1.0, 1.0) 
+                } else { 
+                    (t2, t1, 1.0, -1.0) 
+                };
+
+                if t_near > t_min {
+                    t_min = t_near;
+                    hit_normal_near = [0.0; 3];
+                    hit_normal_near[i] = normal_near;
+                }
+                if t_far < t_max {
+                    t_max = t_far;
+                    hit_normal_far = [0.0; 3];
+                    hit_normal_far[i] = normal_far;
+                }
+            } else if origin_arr[i] < bounds_min[i] || origin_arr[i] > bounds_max[i] {
+                return None;
+            }
+        }
+
+        // Use t_max (farthest) if it's in front of us and within range,
+        // otherwise fall back to t_min (nearest).
+        let (t_hit, hit_normal) = if t_max > 0.0 && t_max < max_dist {
+            (t_max, hit_normal_far)
+        } else if t_min > 0.0 && t_min < t_max && t_min < max_dist {
+            (t_min, hit_normal_near)
+        } else {
+            return None;
+        };
+
+        let p = origin + dir * t_hit;
+        let mut ip = [
+            p.x.floor() as i32,
+            p.y.floor() as i32,
+            p.z.floor() as i32,
+        ];
+
+        // Clamp to ensure it's within bounds and adjust for boundary hits
+        for i in 0..3 {
+            let dim = match i { 0 => CHUNK_WIDTH, 1 => CHUNK_HEIGHT, 2 => CHUNK_DEPTH, _ => unreachable!() } as i32;
+            if hit_normal[i] < 0.0 {
+                ip[i] = 0;
+            } else if hit_normal[i] > 0.0 {
+                ip[i] = dim - 1;
+            } else {
+                ip[i] = ip[i].clamp(0, dim - 1);
+            }
+        }
+
+        let mut coord = [0; 3];
+        let mut inward_normal = [0.0; 3];
+        for i in 0..3 {
+            let dim = match i { 0 => CHUNK_WIDTH, 1 => CHUNK_HEIGHT, 2 => CHUNK_DEPTH, _ => unreachable!() } as i32;
+            if hit_normal[i] < 0.0 {
+                coord[i] = -1;
+                inward_normal[i] = 1.0;
+            } else if hit_normal[i] > 0.0 {
+                coord[i] = dim;
+                inward_normal[i] = -1.0;
+            } else {
+                coord[i] = ip[i];
+            }
+        }
+
+        return Some((coord, inward_normal, false));
     }
 
     fn remesh(&mut self) {
@@ -608,7 +896,17 @@ impl State {
         }
     }
 
-    pub fn update(&mut self) {
+    pub fn update(&mut self, dt: std::time::Duration) {
+        if self.is_undo_pressed && dt - self.last_action_time >= crate::ACTION_REPEAT_DELAY {
+            self.undo();
+            self.last_action_time = dt;
+        }
+
+        if self.is_redo_pressed && dt - self.last_action_time >= crate::ACTION_REPEAT_DELAY {
+            self.redo();
+            self.last_action_time = dt;
+        }
+
         self.camera_controller.update_camera(&mut self.camera);
         self.camera_uniform.update_view_projection(&self.camera);
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[self.camera_uniform]));
@@ -685,6 +983,11 @@ impl State {
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
+
+            // Draw bounding box
+            render_pass.set_pipeline(&self.line_pipeline);
+            render_pass.set_vertex_buffer(0, self.line_vertex_buffer.slice(..));
+            render_pass.draw(0..self.num_line_indices, 0..1);
         }
 
         // UI pass: draws egui on top, preserving the scene (LoadOp::Load).

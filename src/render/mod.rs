@@ -1,5 +1,5 @@
 use crate::core::Chunk;
-use crate::core::chunk::CHUNK_SIZE;
+use crate::core::chunk::{CHUNK_WIDTH, CHUNK_HEIGHT, CHUNK_DEPTH};
 use crate::core::Palette;
 use crate::state::Vertex;
 
@@ -16,51 +16,55 @@ pub fn mesh_chunk(chunk: &Chunk, palette: &Palette) -> (Vec<Vertex>, Vec<u32>) {
         let mut q = [0; 3];
         q[axis] = 1;
 
-        // Mask for the current slice
-        let mut mask = [None; CHUNK_SIZE * CHUNK_SIZE];
+        let dim_axis = match axis { 0 => CHUNK_WIDTH, 1 => CHUNK_HEIGHT, 2 => CHUNK_DEPTH, _ => unreachable!() };
+        let dim_u = match u { 0 => CHUNK_WIDTH, 1 => CHUNK_HEIGHT, 2 => CHUNK_DEPTH, _ => unreachable!() };
+        let dim_v = match v { 0 => CHUNK_WIDTH, 1 => CHUNK_HEIGHT, 2 => CHUNK_DEPTH, _ => unreachable!() };
 
-        for i in -1..CHUNK_SIZE as i32 {
+        // Mask for the current slice
+        let mut mask = vec![None; dim_u * dim_v];
+
+        for i in -1..dim_axis as i32 {
             x[axis] = i;
 
             // Compute mask
-            for j in 0..CHUNK_SIZE {
+            for j in 0..dim_u {
                 x[u] = j as i32;
-                for k in 0..CHUNK_SIZE {
+                for k in 0..dim_v {
                     x[v] = k as i32;
 
                     let voxel_a = if i >= 0 { chunk.get(x[0] as usize, x[1] as usize, x[2] as usize) } else { None };
-                    let voxel_b = if i < (CHUNK_SIZE as i32 - 1) { chunk.get((x[0] + q[0]) as usize, (x[1] + q[1]) as usize, (x[2] + q[2]) as usize) } else { None };
+                    let voxel_b = if i < (dim_axis as i32 - 1) { chunk.get((x[0] + q[0]) as usize, (x[1] + q[1]) as usize, (x[2] + q[2]) as usize) } else { None };
 
                     let a_active = voxel_a.map(|v| !v.is_empty()).unwrap_or(false);
                     let b_active = voxel_b.map(|v| !v.is_empty()).unwrap_or(false);
 
                     if a_active != b_active {
-                        mask[j + k * CHUNK_SIZE] = if a_active {
+                        mask[j + k * dim_u] = if a_active {
                             Some((voxel_a.unwrap().color_index, 1)) // 1 for +direction
                         } else {
                             Some((voxel_b.unwrap().color_index, -1)) // -1 for -direction
                         };
                     } else {
-                        mask[j + k * CHUNK_SIZE] = None;
+                        mask[j + k * dim_u] = None;
                     }
                 }
             }
 
             // Generate mesh from mask
-            for k in 0..CHUNK_SIZE {
+            for k in 0..dim_v {
                 let mut j = 0;
-                while j < CHUNK_SIZE {
-                    if let Some((color_idx, dir)) = mask[j + k * CHUNK_SIZE] {
+                while j < dim_u {
+                    if let Some((color_idx, dir)) = mask[j + k * dim_u] {
                         let mut width = 1;
-                        while j + width < CHUNK_SIZE && mask[j + width + k * CHUNK_SIZE] == Some((color_idx, dir)) {
+                        while j + width < dim_u && mask[j + width + k * dim_u] == Some((color_idx, dir)) {
                             width += 1;
                         }
 
                         let mut height = 1;
                         let mut done = false;
-                        while k + height < CHUNK_SIZE {
+                        while k + height < dim_v {
                             for m in 0..width {
-                                if mask[j + m + (k + height) * CHUNK_SIZE] != Some((color_idx, dir)) {
+                                if mask[j + m + (k + height) * dim_u] != Some((color_idx, dir)) {
                                     done = true;
                                     break;
                                 }
@@ -97,7 +101,7 @@ pub fn mesh_chunk(chunk: &Chunk, palette: &Palette) -> (Vec<Vertex>, Vec<u32>) {
                         // Clear mask
                         for m in 0..height {
                             for n in 0..width {
-                                mask[j + n + (k + m) * CHUNK_SIZE] = None;
+                                mask[j + n + (k + m) * dim_u] = None;
                             }
                         }
                         j += width;

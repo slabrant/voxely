@@ -26,6 +26,20 @@ impl EditHistory {
         self.redo.clear();
     }
 
+    /// Records an edit that is part of a continuous stroke. 
+    /// If the last edit was at the same coordinates, it updates it instead of pushing a new one.
+    /// This prevents a single drag stroke from filling the undo buffer with many small changes
+    /// to the same voxel.
+    pub fn record_continuous(&mut self, edit: VoxelEdit) {
+        if let Some(last) = self.undo.last_mut() {
+            if last.x == edit.x && last.y == edit.y && last.z == edit.z {
+                last.new = edit.new;
+                return;
+            }
+        }
+        self.record(edit);
+    }
+
     /// Pops the most recent edit. The caller should re-apply `old` at the
     /// edit's position to revert it.
     pub fn undo(&mut self) -> Option<VoxelEdit> {

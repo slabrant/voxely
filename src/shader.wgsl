@@ -40,3 +40,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     
     return vec4<f32>(in.color * lighting, 1.0);
 }
+@fragment
+fn fs_line(in: VertexOutput) -> @location(0) vec4<f32> {
+    return vec4<f32>(in.color, 0.5);
+}

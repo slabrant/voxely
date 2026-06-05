@@ -12,8 +12,11 @@ pub mod editor;
 pub mod io;
 pub mod render;
 
+pub const ACTION_REPEAT_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
+
     pub async fn run() {
     env_logger::init();
+    let start_time = std::time::Instant::now();
 
     println!("--- Voxely Quick Start ---");
     println!("Orbit: Right-Click + Drag  |  Pan: Middle-Click + Drag  |  Zoom: Scroll");
@@ -52,7 +55,7 @@ pub mod render;
                             state.resize(*physical_size);
                         }
                         WindowEvent::RedrawRequested => {
-                            state.update();
+                            state.update(start_time.elapsed());
                             match state.render() {
                                 Ok(_) => {}
                                 // Reconfigure the surface if lost
