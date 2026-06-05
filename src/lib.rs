@@ -8,18 +8,20 @@ use winit::{
 mod state;
 mod camera;
 pub mod core;
+pub mod editor;
+pub mod io;
 pub mod render;
 
     pub async fn run() {
     env_logger::init();
-    
+
     println!("--- Voxely Quick Start ---");
-    println!("Orbit: Right-Click + Drag");
-    println!("Pan: Middle-Click + Drag");
-    println!("Zoom: Scroll Wheel");
-    println!("Place Voxel: Left-Click");
-    println!("Change Color: 1, 2, 3, 4");
-    println!("Save: S | Load: L | Import MagicaVoxel: I");
+    println!("Orbit: Right-Click + Drag  |  Pan: Middle-Click + Drag  |  Zoom: Scroll");
+    println!("Place Voxel: Left-Click    |  Remove Voxel: Shift + Left-Click");
+    println!("Change Color: 1-9");
+    println!("Undo: Ctrl+Z  |  Redo: Ctrl+Y");
+    println!("Save: Ctrl+S  |  Load: Ctrl+L");
+    println!("Import .vox: Ctrl+I  |  Export .obj: Ctrl+E");
     println!("--------------------------");
 
     let event_loop = EventLoop::new().unwrap();

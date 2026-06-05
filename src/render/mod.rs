@@ -1,18 +1,9 @@
 use crate::core::Chunk;
 use crate::core::chunk::CHUNK_SIZE;
+use crate::core::Palette;
 use crate::state::Vertex;
 
-fn get_color(index: u8) -> [f32; 3] {
-    match index {
-        1 => [0.8, 0.1, 0.1], // Red
-        2 => [0.1, 0.8, 0.1], // Green
-        3 => [0.1, 0.1, 0.8], // Blue
-        4 => [0.8, 0.8, 0.1], // Yellow
-        _ => [1.0, 1.0, 1.0], // White
-    }
-}
-
-pub fn mesh_chunk(chunk: &Chunk) -> (Vec<Vertex>, Vec<u16>) {
+pub fn mesh_chunk(chunk: &Chunk, palette: &Palette) -> (Vec<Vertex>, Vec<u32>) {
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
 
@@ -87,15 +78,18 @@ pub fn mesh_chunk(chunk: &Chunk) -> (Vec<Vertex>, Vec<u16>) {
                         let mut normal = [0.0; 3];
                         normal[axis] = if dir > 0 { 1.0 } else { -1.0 };
 
+                        // The face lies on the boundary plane between slice `i`
+                        // and `i+1`, i.e. at `x[axis] + 1`, no matter which way it
+                        // faces. (`q` is 1 on `axis`, 0 elsewhere.)
                         add_quad(
                             &mut vertices,
                             &mut indices,
-                            [x[0] as f32 + (if dir > 0 { q[0] } else { 0 }) as f32, 
-                             x[1] as f32 + (if dir > 0 { q[1] } else { 0 }) as f32, 
-                             x[2] as f32 + (if dir > 0 { q[2] } else { 0 }) as f32],
+                            [x[0] as f32 + q[0] as f32,
+                             x[1] as f32 + q[1] as f32,
+                             x[2] as f32 + q[2] as f32],
                             [du[0] as f32, du[1] as f32, du[2] as f32],
                             [dv[0] as f32, dv[1] as f32, dv[2] as f32],
-                            get_color(color_idx),
+                            palette.linear_rgb(color_idx),
                             normal,
                             dir > 0
                         );
@@ -120,7 +114,7 @@ pub fn mesh_chunk(chunk: &Chunk) -> (Vec<Vertex>, Vec<u16>) {
 
 fn add_quad(
     vertices: &mut Vec<Vertex>,
-    indices: &mut Vec<u16>,
+    indices: &mut Vec<u32>,
     pos: [f32; 3],
     du: [f32; 3],
     dv: [f32; 3],
@@ -128,7 +122,7 @@ fn add_quad(
     normal: [f32; 3],
     backwards: bool,
 ) {
-    let start_idx = vertices.len() as u16;
+    let start_idx = vertices.len() as u32;
 
     vertices.push(Vertex { position: pos, color, normal });
     vertices.push(Vertex { position: [pos[0] + du[0], pos[1] + du[1], pos[2] + du[2]], color, normal });
@@ -139,5 +133,35 @@ fn add_quad(
         indices.extend_from_slice(&[start_idx, start_idx + 2, start_idx + 1, start_idx, start_idx + 3, start_idx + 2]);
     } else {
         indices.extend_from_slice(&[start_idx, start_idx + 1, start_idx + 2, start_idx, start_idx + 2, start_idx + 3]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::Voxel;
+
+    #[test]
+    fn single_voxel_meshes_to_its_own_unit_cube() {
+        // An isolated voxel at (p) must produce exactly six faces whose every
+        // vertex lies on the cube [p, p+1]^3. This guards against the
+        // negative-face off-by-one (which placed faces at p-1).
+        let p = 5.0;
+        let mut chunk = Chunk::new();
+        chunk.set(5, 5, 5, Voxel { color_index: 1 });
+
+        let (vertices, indices) = mesh_chunk(&chunk, &Palette::default());
+
+        assert_eq!(vertices.len(), 24, "6 faces * 4 verts");
+        assert_eq!(indices.len(), 36, "6 faces * 2 tris * 3");
+        for v in &vertices {
+            for &c in &v.position {
+                assert!(
+                    (p..=p + 1.0).contains(&c),
+                    "vertex coord {c} escaped the [{p}, {}] cube",
+                    p + 1.0
+                );
+            }
+        }
     }
 }

@@ -1,3 +1,8 @@
 /target
 .idea
 voxely.iml
+
+# Generated runtime artifacts
+/project.voxely
+/model.obj
+/model.mtl

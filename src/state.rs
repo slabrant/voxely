@@ -1,10 +1,17 @@
 use crate::camera::{Camera, CameraUniform, CameraController};
+use crate::core::{Palette, Voxel};
+use crate::editor::{EditHistory, VoxelEdit};
 use glam::Vec4Swizzles;
 use std::sync::Arc;
 use winit::{
     event::WindowEvent,
+    keyboard::ModifiersState,
     window::Window,
 };
+
+const PROJECT_PATH: &str = "project.voxely";
+const VOX_PATH: &str = "model.vox";
+const OBJ_PATH: &str = "model.obj";
 
 pub struct State {
     surface: wgpu::Surface<'static>,
@@ -12,7 +19,6 @@ pub struct State {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     pub size: winit::dpi::PhysicalSize<u32>,
-    window: Arc<Window>,
     render_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
@@ -24,8 +30,11 @@ pub struct State {
     camera_controller: CameraController,
     depth_texture: Texture,
     chunk: crate::core::Chunk,
+    palette: Palette,
+    history: EditHistory,
     cursor_position: winit::dpi::PhysicalPosition<f64>,
     current_color_index: u8,
+    modifiers: ModifiersState,
 }
 
 pub struct Texture {
@@ -119,10 +128,9 @@ impl State {
             ..Default::default()
         });
         
-        // # Safety
-        //
-        // The surface needs to live as long as the window that created it.
-        // State owns the window, so this should be safe.
+        // The surface must not outlive the window it was created from. We hand
+        // `create_surface` an owned `Arc<Window>` clone, so the surface keeps the
+        // window alive for as long as it lives.
         let surface = instance.create_surface(Arc::clone(&window)).unwrap();
 
         let adapter = instance.request_adapter(
@@ -275,20 +283,22 @@ impl State {
 
         let camera_controller = CameraController::new(0.2, 0.005);
 
+        let palette = Palette::default();
+
         let mut chunk = crate::core::Chunk::new();
         // Create a basic 16x16 floor
         for x in 0..16 {
             for z in 0..16 {
                 let color = if (x + z) % 2 == 0 { 4 } else { 1 }; // Checkerboard
-                chunk.set(x, 0, z, crate::core::Voxel { color_index: color });
+                chunk.set(x, 0, z, Voxel { color_index: color });
             }
         }
         // Add a small pillar in the middle
         for y in 1..4 {
-            chunk.set(8, y, 8, crate::core::Voxel { color_index: 2 });
+            chunk.set(8, y, 8, Voxel { color_index: 2 });
         }
 
-        let (mesh_vertices, mesh_indices) = crate::render::mesh_chunk(&chunk);
+        let (mesh_vertices, mesh_indices) = crate::render::mesh_chunk(&chunk, &palette);
 
         let vertex_buffer = device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
@@ -308,7 +318,6 @@ impl State {
         let num_indices = mesh_indices.len() as u32;
 
         Self {
-            window,
             surface,
             device,
             queue,
@@ -325,8 +334,11 @@ impl State {
             camera_controller,
             depth_texture,
             chunk,
+            palette,
+            history: EditHistory::default(),
             cursor_position: winit::dpi::PhysicalPosition::new(0.0, 0.0),
             current_color_index: 1,
+            modifiers: ModifiersState::empty(),
         }
     }
 
@@ -357,33 +369,45 @@ impl State {
                 }
                 self.camera_controller.process_events(event)
             }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers.state();
+                false
+            }
             WindowEvent::KeyboardInput {
                 event: winit::event::KeyEvent {
-                    state: winit::event::ElementState::Pressed,
+                    state,
                     physical_key: winit::keyboard::PhysicalKey::Code(key),
+                    repeat,
                     ..
                 },
                 ..
             } => {
-                match key {
-                    winit::keyboard::KeyCode::Digit1 => { self.current_color_index = 1; true }
-                    winit::keyboard::KeyCode::Digit2 => { self.current_color_index = 2; true }
-                    winit::keyboard::KeyCode::Digit3 => { self.current_color_index = 3; true }
-                    winit::keyboard::KeyCode::Digit4 => { self.current_color_index = 4; true }
-                    winit::keyboard::KeyCode::KeyS if self.window.clone().inner_size().width > 0 => { // Just use Ctrl+S if possible
-                        self.save_project();
-                        true
+                use winit::keyboard::KeyCode;
+                let pressed = *state == winit::event::ElementState::Pressed;
+                if pressed && !*repeat {
+                    let ctrl = self.modifiers.control_key();
+                    match key {
+                        KeyCode::Digit1 => { self.current_color_index = 1; return true; }
+                        KeyCode::Digit2 => { self.current_color_index = 2; return true; }
+                        KeyCode::Digit3 => { self.current_color_index = 3; return true; }
+                        KeyCode::Digit4 => { self.current_color_index = 4; return true; }
+                        KeyCode::Digit5 => { self.current_color_index = 5; return true; }
+                        KeyCode::Digit6 => { self.current_color_index = 6; return true; }
+                        KeyCode::Digit7 => { self.current_color_index = 7; return true; }
+                        KeyCode::Digit8 => { self.current_color_index = 8; return true; }
+                        KeyCode::Digit9 => { self.current_color_index = 9; return true; }
+                        KeyCode::KeyS if ctrl => { self.save_project(); return true; }
+                        KeyCode::KeyL if ctrl => { self.load_project(); return true; }
+                        KeyCode::KeyI if ctrl => { self.import_vox(); return true; }
+                        KeyCode::KeyE if ctrl => { self.export_obj(); return true; }
+                        KeyCode::KeyZ if ctrl => { self.undo(); return true; }
+                        KeyCode::KeyY if ctrl => { self.redo(); return true; }
+                        _ => {}
                     }
-                    winit::keyboard::KeyCode::KeyL => {
-                        self.load_project();
-                        true
-                    }
-                    winit::keyboard::KeyCode::KeyI => {
-                        self.import_vox();
-                        true
-                    }
-                    _ => self.camera_controller.process_events(event),
                 }
+                // Forward every press AND release to the camera controller so
+                // held movement keys don't get stuck on (releases must arrive).
+                self.camera_controller.process_events(event)
             }
             WindowEvent::MouseWheel { .. } => {
                 self.camera_controller.process_events(event)
@@ -393,26 +417,58 @@ impl State {
     }
 
     fn handle_click(&mut self) {
-        // 1. Ray from camera through cursor
         let ray_dir = self.screen_to_ray(self.cursor_position);
         let ray_origin = self.camera.eye;
 
-        // 2. Raycast against voxels
         if let Some((pos, normal)) = self.raycast(ray_origin, ray_dir) {
-            // Right click or modifier could be for removal, but for now let's just place
-            // Shift + Click for removal?
-            let _is_shift_pressed = self.window.clone().inner_size().width > 0; // Dummy check for now
-            // Actually, let's just implement placement for now.
-            
-            let place_pos = [
-                (pos[0] as f32 + normal[0] * 0.5).floor() as i32,
-                (pos[1] as f32 + normal[1] * 0.5).floor() as i32,
-                (pos[2] as f32 + normal[2] * 0.5).floor() as i32,
-            ];
-
-            if self.chunk.set(place_pos[0] as usize, place_pos[1] as usize, place_pos[2] as usize, crate::core::Voxel { color_index: self.current_color_index }) {
-                self.remesh();
+            if self.modifiers.shift_key() {
+                // Remove the voxel that was hit.
+                self.set_voxel(pos[0], pos[1], pos[2], Voxel { color_index: 0 });
+            } else {
+                // Place a new voxel against the hit face, one cell along the normal.
+                self.set_voxel(
+                    pos[0] + normal[0] as i32,
+                    pos[1] + normal[1] as i32,
+                    pos[2] + normal[2] as i32,
+                    Voxel { color_index: self.current_color_index },
+                );
             }
+        }
+    }
+
+    /// Sets a voxel, recording the change for undo and re-meshing only if
+    /// something actually changed. Coordinates outside the chunk are ignored.
+    fn set_voxel(&mut self, x: i32, y: i32, z: i32, voxel: Voxel) -> bool {
+        if x < 0 || y < 0 || z < 0 {
+            return false;
+        }
+        let (xu, yu, zu) = (x as usize, y as usize, z as usize);
+        let old = match self.chunk.get(xu, yu, zu) {
+            Some(v) => *v,
+            None => return false,
+        };
+        if old == voxel {
+            return false;
+        }
+        self.chunk.set(xu, yu, zu, voxel);
+        self.history.record(VoxelEdit { x: xu, y: yu, z: zu, old, new: voxel });
+        self.remesh();
+        true
+    }
+
+    fn undo(&mut self) {
+        if let Some(e) = self.history.undo() {
+            self.chunk.set(e.x, e.y, e.z, e.old);
+            self.remesh();
+            println!("Undo");
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(e) = self.history.redo() {
+            self.chunk.set(e.x, e.y, e.z, e.new);
+            self.remesh();
+            println!("Redo");
         }
     }
 
@@ -462,8 +518,8 @@ impl State {
     }
 
     fn remesh(&mut self) {
-        let (mesh_vertices, mesh_indices) = crate::render::mesh_chunk(&self.chunk);
-        
+        let (mesh_vertices, mesh_indices) = crate::render::mesh_chunk(&self.chunk, &self.palette);
+
         use wgpu::util::DeviceExt;
         self.vertex_buffer = self.device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
@@ -484,30 +540,42 @@ impl State {
     }
 
     fn save_project(&self) {
-        let serialized = bincode::serialize(&self.chunk).unwrap();
-        std::fs::write("project.voxely", serialized).unwrap();
-        println!("Project saved to project.voxely");
+        match crate::io::save_project(PROJECT_PATH, &self.chunk, &self.palette) {
+            Ok(()) => println!("Saved {PROJECT_PATH}"),
+            Err(e) => eprintln!("Save failed: {e}"),
+        }
     }
 
     fn load_project(&mut self) {
-        if let Ok(data) = std::fs::read("project.voxely") {
-            let chunk: crate::core::Chunk = bincode::deserialize(&data).unwrap();
-            self.chunk = chunk;
-            self.remesh();
-            println!("Project loaded from project.voxely");
+        match crate::io::load_project(PROJECT_PATH) {
+            Ok(project) => {
+                self.chunk = project.chunk;
+                self.palette = project.palette;
+                self.history.clear();
+                self.remesh();
+                println!("Loaded {PROJECT_PATH}");
+            }
+            Err(e) => eprintln!("Load failed: {e}"),
         }
     }
 
     fn import_vox(&mut self) {
-        if let Ok(data) = dot_vox::load("model.vox") {
-            let model = &data.models[0];
-            let mut new_chunk = crate::core::Chunk::new();
-            for voxel in &model.voxels {
-                new_chunk.set(voxel.x as usize, voxel.z as usize, voxel.y as usize, crate::core::Voxel { color_index: voxel.i });
+        match crate::io::import_vox(VOX_PATH) {
+            Ok(project) => {
+                self.chunk = project.chunk;
+                self.palette = project.palette;
+                self.history.clear();
+                self.remesh();
+                println!("Imported {VOX_PATH}");
             }
-            self.chunk = new_chunk;
-            self.remesh();
-            println!("Imported model.vox");
+            Err(e) => eprintln!("Import failed: {e}"),
+        }
+    }
+
+    fn export_obj(&self) {
+        match crate::io::export_obj(OBJ_PATH, &self.chunk, &self.palette) {
+            Ok(()) => println!("Exported {OBJ_PATH} (+ .mtl)"),
+            Err(e) => eprintln!("Export failed: {e}"),
         }
     }
 
@@ -556,7 +624,7 @@ impl State {
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
         }
 
