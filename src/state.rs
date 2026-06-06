@@ -53,6 +53,8 @@ pub struct State {
     drag_start_voxels: Vec<[i32; 3]>,
     rect_drag: Option<RectDrag>,
     tool: Tool,
+    /// Canvas dimensions edited in the UI, applied on "Resize".
+    pending_size: [usize; 3],
 }
 
 /// The active editing tool, chosen from the UI or with a hotkey.
@@ -423,6 +425,7 @@ impl State {
         let palette = Palette::default();
 
         let chunk = crate::core::Chunk::new();
+        let (chunk_w, chunk_h, chunk_d) = (chunk.width, chunk.height, chunk.depth);
 
         let (mesh_vertices, mesh_indices) = crate::render::mesh_chunk(&chunk, &palette);
 
@@ -443,46 +446,14 @@ impl State {
         );
         let num_indices = mesh_indices.len() as u32;
 
-        use crate::core::chunk::{CHUNK_WIDTH, CHUNK_HEIGHT, CHUNK_DEPTH};
-        let w = CHUNK_WIDTH as f32;
-        let h = CHUNK_HEIGHT as f32;
-        let d = CHUNK_DEPTH as f32;
-        let line_vertices = [
-            // Bottom square
-            Vertex { position: [0.0, 0.0, 0.0], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
-            Vertex { position: [w, 0.0, 0.0], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
-            Vertex { position: [w, 0.0, 0.0], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
-            Vertex { position: [w, 0.0, d], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
-            Vertex { position: [w, 0.0, d], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
-            Vertex { position: [0.0, 0.0, d], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
-            Vertex { position: [0.0, 0.0, d], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
-            Vertex { position: [0.0, 0.0, 0.0], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
-            // Top square
-            Vertex { position: [0.0, h, 0.0], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
-            Vertex { position: [w, h, 0.0], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
-            Vertex { position: [w, h, 0.0], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
-            Vertex { position: [w, h, d], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
-            Vertex { position: [w, h, d], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
-            Vertex { position: [0.0, h, d], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
-            Vertex { position: [0.0, h, d], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
-            Vertex { position: [0.0, h, 0.0], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
-            // Pillars
-            Vertex { position: [0.0, 0.0, 0.0], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
-            Vertex { position: [0.0, h, 0.0], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
-            Vertex { position: [w, 0.0, 0.0], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
-            Vertex { position: [w, h, 0.0], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
-            Vertex { position: [w, 0.0, d], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
-            Vertex { position: [w, h, d], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
-            Vertex { position: [0.0, 0.0, d], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
-            Vertex { position: [0.0, h, d], color: [1.0, 1.0, 1.0], normal: [0.0, 0.0, 0.0] },
-        ];
+        let line_vertices = bounding_box_lines(&chunk);
         let num_line_indices = line_vertices.len() as u32;
 
         let line_vertex_buffer = device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
                 label: Some("Line Vertex Buffer"),
                 contents: bytemuck::cast_slice(&line_vertices),
-                usage: wgpu::BufferUsages::VERTEX,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             }
         );
 
@@ -542,6 +513,7 @@ impl State {
             drag_start_voxels: Vec::new(),
             rect_drag: None,
             tool: Tool::Brush,
+            pending_size: [chunk_w, chunk_h, chunk_d],
         }
     }
 
@@ -848,8 +820,7 @@ impl State {
         v_axis: usize,
         face_world: f32,
     ) -> (i32, i32) {
-        use crate::core::chunk::{CHUNK_WIDTH, CHUNK_HEIGHT, CHUNK_DEPTH};
-        let dims = [CHUNK_WIDTH as i32, CHUNK_HEIGHT as i32, CHUNK_DEPTH as i32];
+        let dims = [self.chunk.width as i32, self.chunk.height as i32, self.chunk.depth as i32];
         let o = origin.to_array();
         let d = dir.to_array();
         if d[axis].abs() < 1e-6 {
@@ -885,7 +856,7 @@ impl State {
     /// instead. The whole flood is recorded as a single undo group by the
     /// caller. Does nothing if the cursor isn't over a solid voxel.
     fn handle_bucket(&mut self) {
-        use crate::core::chunk::{CHUNK_WIDTH, CHUNK_HEIGHT, CHUNK_DEPTH};
+        let (cw, ch, cd) = (self.chunk.width, self.chunk.height, self.chunk.depth);
         let ray_dir = self.screen_to_ray(self.cursor_position);
         let ray_origin = self.camera.eye;
 
@@ -923,11 +894,11 @@ impl State {
             });
             changed = true;
 
-            if x + 1 < CHUNK_WIDTH { stack.push([x + 1, y, z]); }
+            if x + 1 < cw { stack.push([x + 1, y, z]); }
             if x > 0 { stack.push([x - 1, y, z]); }
-            if y + 1 < CHUNK_HEIGHT { stack.push([x, y + 1, z]); }
+            if y + 1 < ch { stack.push([x, y + 1, z]); }
             if y > 0 { stack.push([x, y - 1, z]); }
-            if z + 1 < CHUNK_DEPTH { stack.push([x, y, z + 1]); }
+            if z + 1 < cd { stack.push([x, y, z + 1]); }
             if z > 0 { stack.push([x, y, z - 1]); }
         }
 
@@ -1071,47 +1042,70 @@ impl State {
     }
 
     fn raycast(&self, origin: glam::Vec3, dir: glam::Vec3) -> Option<([i32; 3], [f32; 3], bool)> {
-        // First check for voxel hits
-        let mut t = 0.0;
         let max_dist = 100.0;
-        let step = 0.1;
 
+        // Amanatides–Woo voxel traversal. Unlike fixed-step sampling, this lands
+        // on every cell the ray crosses in order and tracks exactly which face
+        // we entered through, so the placement normal is always correct (no more
+        // voxels embedded in the surface they were placed against).
+        let o = origin.to_array();
+        let d = dir.to_array();
+        let mut ip = [o[0].floor() as i32, o[1].floor() as i32, o[2].floor() as i32];
+        let mut step = [0i32; 3];
+        let mut t_max = [f32::INFINITY; 3];
+        let mut t_delta = [f32::INFINITY; 3];
+        for i in 0..3 {
+            if d[i] > 0.0 {
+                step[i] = 1;
+                t_max[i] = (ip[i] as f32 + 1.0 - o[i]) / d[i];
+                t_delta[i] = 1.0 / d[i];
+            } else if d[i] < 0.0 {
+                step[i] = -1;
+                t_max[i] = (ip[i] as f32 - o[i]) / d[i];
+                t_delta[i] = -1.0 / d[i];
+            }
+        }
+
+        // Normal of the face we entered the current cell through. Zero until the
+        // first boundary crossing (i.e. while still in the origin's own cell).
+        let mut normal = [0.0f32; 3];
+        let mut t = 0.0;
         while t < max_dist {
-            let p = origin + dir * t;
-            let ip = [p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32];
-            
-            if let Some(voxel) = self.chunk.get(ip[0] as usize, ip[1] as usize, ip[2] as usize) {
-                if !voxel.is_empty() {
-                    let is_drag_voxel = self.drag_start_voxels.contains(&ip);
-
-                    // Primitive normal detection
-                    let mut normal = [0.0; 3];
-                    let local_p = p - glam::Vec3::new(ip[0] as f32 + 0.5, ip[1] as f32 + 0.5, ip[2] as f32 + 0.5);
-                    let abs_p = local_p.abs();
-                    if abs_p.x > abs_p.y && abs_p.x > abs_p.z {
-                        normal[0] = local_p.x.signum();
-                    } else if abs_p.y > abs_p.z {
-                        normal[1] = local_p.y.signum();
-                    } else {
-                        normal[2] = local_p.z.signum();
+            if ip[0] >= 0 && ip[1] >= 0 && ip[2] >= 0 {
+                if let Some(voxel) = self.chunk.get(ip[0] as usize, ip[1] as usize, ip[2] as usize) {
+                    if !voxel.is_empty() {
+                        let is_drag_voxel = self.drag_start_voxels.contains(&ip);
+                        return Some((ip, normal, is_drag_voxel));
                     }
-                    return Some((ip, normal, is_drag_voxel));
                 }
             }
-            t += step;
+            // Advance to the next cell along whichever axis has the nearest
+            // boundary; the face we cross faces back the way we came.
+            let axis = if t_max[0] <= t_max[1] && t_max[0] <= t_max[2] {
+                0
+            } else if t_max[1] <= t_max[2] {
+                1
+            } else {
+                2
+            };
+            ip[axis] += step[axis];
+            t = t_max[axis];
+            t_max[axis] += t_delta[axis];
+            normal = [0.0; 3];
+            normal[axis] = -step[axis] as f32;
         }
 
         // If no voxel was hit, check for intersection with the world's bounding box boundaries.
         // This allows building from the limits when the world is empty.
-        use crate::core::chunk::{CHUNK_WIDTH, CHUNK_HEIGHT, CHUNK_DEPTH};
-        
+        let dims = [self.chunk.width as i32, self.chunk.height as i32, self.chunk.depth as i32];
+
         let mut t_min = f32::NEG_INFINITY;
         let mut t_max = f32::INFINITY;
         let mut hit_normal_near = [0.0; 3];
         let mut hit_normal_far = [0.0; 3];
 
         let bounds_min = [0.0, 0.0, 0.0];
-        let bounds_max = [CHUNK_WIDTH as f32, CHUNK_HEIGHT as f32, CHUNK_DEPTH as f32];
+        let bounds_max = [dims[0] as f32, dims[1] as f32, dims[2] as f32];
         let origin_arr = [origin.x, origin.y, origin.z];
         let dir_arr = [dir.x, dir.y, dir.z];
 
@@ -1160,7 +1154,7 @@ impl State {
 
         // Clamp to ensure it's within bounds and adjust for boundary hits
         for i in 0..3 {
-            let dim = match i { 0 => CHUNK_WIDTH, 1 => CHUNK_HEIGHT, 2 => CHUNK_DEPTH, _ => unreachable!() } as i32;
+            let dim = dims[i];
             if hit_normal[i] < 0.0 {
                 ip[i] = 0;
             } else if hit_normal[i] > 0.0 {
@@ -1173,7 +1167,7 @@ impl State {
         let mut coord = [0; 3];
         let mut inward_normal = [0.0; 3];
         for i in 0..3 {
-            let dim = match i { 0 => CHUNK_WIDTH, 1 => CHUNK_HEIGHT, 2 => CHUNK_DEPTH, _ => unreachable!() } as i32;
+            let dim = dims[i];
             if hit_normal[i] < 0.0 {
                 coord[i] = -1;
                 inward_normal[i] = 1.0;
@@ -1186,6 +1180,43 @@ impl State {
         }
 
         return Some((coord, inward_normal, false));
+    }
+
+    /// Resizes the canvas, keeping voxels that still fit (anchored at the
+    /// origin). Clears history since old coordinates may no longer be valid,
+    /// then rebuilds the mesh and bounding-box wireframe.
+    fn resize_canvas(&mut self, width: usize, height: usize, depth: usize) {
+        use crate::core::chunk::MAX_CHUNK_SIZE;
+        let width = width.clamp(1, MAX_CHUNK_SIZE);
+        let height = height.clamp(1, MAX_CHUNK_SIZE);
+        let depth = depth.clamp(1, MAX_CHUNK_SIZE);
+        if (width, height, depth) == (self.chunk.width, self.chunk.height, self.chunk.depth) {
+            return;
+        }
+        self.chunk = self.chunk.resized(width, height, depth);
+        self.history.clear();
+        self.last_grid_coord = None;
+        self.rect_drag = None;
+        self.sync_to_chunk();
+    }
+
+    /// Rebuilds canvas-dependent GPU state (mesh + bounding box) and resets the
+    /// pending UI size to match the current chunk. Call after the chunk's
+    /// dimensions change (resize, load, import).
+    fn sync_to_chunk(&mut self) {
+        self.pending_size = [self.chunk.width, self.chunk.height, self.chunk.depth];
+
+        use wgpu::util::DeviceExt;
+        let line_vertices = bounding_box_lines(&self.chunk);
+        self.num_line_indices = line_vertices.len() as u32;
+        self.line_vertex_buffer = self.device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Line Vertex Buffer"),
+                contents: bytemuck::cast_slice(&line_vertices),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            },
+        );
+        self.remesh();
     }
 
     fn remesh(&mut self) {
@@ -1223,7 +1254,7 @@ impl State {
                 self.chunk = project.chunk;
                 self.palette = project.palette;
                 self.history.clear();
-                self.remesh();
+                self.sync_to_chunk();
                 println!("Loaded {PROJECT_PATH}");
             }
             Err(e) => eprintln!("Load failed: {e}"),
@@ -1236,7 +1267,7 @@ impl State {
                 self.chunk = project.chunk;
                 self.palette = project.palette;
                 self.history.clear();
-                self.remesh();
+                self.sync_to_chunk();
                 println!("Imported {VOX_PATH}");
             }
             Err(e) => eprintln!("Import failed: {e}"),
@@ -1244,8 +1275,18 @@ impl State {
     }
 
     fn export_obj(&self) {
-        match crate::io::export_obj(OBJ_PATH, &self.chunk, &self.palette) {
-            Ok(()) => println!("Exported {OBJ_PATH} (+ .mtl)"),
+        // Ask the OS where to write via a native "save as" dialog. `.mtl` is
+        // written alongside with a matching stem by `io::export_obj`.
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Export as .obj")
+            .add_filter("Wavefront OBJ", &["obj"])
+            .set_file_name(OBJ_PATH)
+            .save_file()
+        else {
+            return; // user cancelled
+        };
+        match crate::io::export_obj(&path, &self.chunk, &self.palette) {
+            Ok(()) => println!("Exported {} (+ .mtl)", path.display()),
             Err(e) => eprintln!("Export failed: {e}"),
         }
     }
@@ -1436,6 +1477,32 @@ impl State {
                     }
                 });
 
+                ui.add_space(6.0);
+                ui.label(format!(
+                    "Canvas size ({}×{}×{})",
+                    self.chunk.width, self.chunk.height, self.chunk.depth
+                ));
+                let max = crate::core::chunk::MAX_CHUNK_SIZE;
+                ui.horizontal(|ui| {
+                    for (i, axis) in ["W", "H", "D"].iter().enumerate() {
+                        ui.label(*axis);
+                        ui.add(
+                            egui::DragValue::new(&mut self.pending_size[i])
+                                .clamp_range(1..=max)
+                                .speed(0.25),
+                        );
+                    }
+                });
+                let [pw, ph, pd] = self.pending_size;
+                let changed = [pw, ph, pd]
+                    != [self.chunk.width, self.chunk.height, self.chunk.depth];
+                if ui
+                    .add_enabled(changed, egui::Button::new("Resize canvas"))
+                    .clicked()
+                {
+                    self.resize_canvas(pw, ph, pd);
+                }
+
                 ui.separator();
                 ui.label(format!("Active color: #{}", self.current_color_index));
 
@@ -1496,6 +1563,31 @@ impl State {
                 ui.label("Bucket click: fill region · Shift: erase region");
             });
     }
+}
+
+/// Builds the wireframe edges of the chunk's bounding box as a `LineList`
+/// (every pair of consecutive vertices is one segment).
+fn bounding_box_lines(chunk: &crate::core::Chunk) -> Vec<Vertex> {
+    let (w, h, d) = (chunk.width as f32, chunk.height as f32, chunk.depth as f32);
+    let c = [1.0, 1.0, 1.0];
+    let n = [0.0, 0.0, 0.0];
+    let v = |position: [f32; 3]| Vertex { position, color: c, normal: n };
+    // The 8 corners, then the 12 edges as index pairs into them.
+    let corners = [
+        [0.0, 0.0, 0.0], [w, 0.0, 0.0], [w, 0.0, d], [0.0, 0.0, d],
+        [0.0, h, 0.0], [w, h, 0.0], [w, h, d], [0.0, h, d],
+    ];
+    const EDGES: [(usize, usize); 12] = [
+        (0, 1), (1, 2), (2, 3), (3, 0), // bottom square
+        (4, 5), (5, 6), (6, 7), (7, 4), // top square
+        (0, 4), (1, 5), (2, 6), (3, 7), // pillars
+    ];
+    let mut out = Vec::with_capacity(EDGES.len() * 2);
+    for (a, b) in EDGES {
+        out.push(v(corners[a]));
+        out.push(v(corners[b]));
+    }
+    out
 }
 
 /// Appends two triangles forming the quad `base + s*du + t*dv` (s,t ∈ [0,1]),

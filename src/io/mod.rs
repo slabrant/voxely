@@ -4,7 +4,6 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::chunk::{CHUNK_WIDTH, CHUNK_HEIGHT, CHUNK_DEPTH};
 use crate::core::{Chunk, Palette, Voxel};
 
 /// Everything persisted in a native `.voxely` project file.
@@ -59,7 +58,10 @@ pub fn import_vox(path: impl AsRef<Path>) -> Result<Project, Box<dyn Error>> {
         }
     }
     if dropped > 0 {
-        log::warn!("{dropped} voxels were outside the {CHUNK_WIDTH}x{CHUNK_HEIGHT}x{CHUNK_DEPTH} chunk and were dropped on import");
+        log::warn!(
+            "{dropped} voxels were outside the {}x{}x{} chunk and were dropped on import",
+            chunk.width, chunk.height, chunk.depth
+        );
     }
 
     Ok(Project { chunk, palette })
@@ -109,9 +111,9 @@ pub fn export_obj(path: impl AsRef<Path>, chunk: &Chunk, palette: &Palette) -> R
     let mut used = std::collections::BTreeSet::new();
     let mut by_color: std::collections::BTreeMap<u8, Vec<(usize, usize, usize)>> = std::collections::BTreeMap::new();
     let (mut min, mut max) = ([usize::MAX; 3], [usize::MIN; 3]);
-    for x in 0..CHUNK_WIDTH {
-        for y in 0..CHUNK_HEIGHT {
-            for z in 0..CHUNK_DEPTH {
+    for x in 0..chunk.width {
+        for y in 0..chunk.height {
+            for z in 0..chunk.depth {
                 if let Some(v) = chunk.get(x, y, z) {
                     if !v.is_empty() {
                         by_color.entry(v.color_index).or_default().push((x, y, z));
@@ -138,6 +140,10 @@ pub fn export_obj(path: impl AsRef<Path>, chunk: &Chunk, palette: &Palette) -> R
         )
     };
 
+    // World-units emitted per voxel. OBJ is unitless but importers (Godot)
+    // treat one unit as one metre, so a unit cube per voxel gives a 1 m block.
+    const VOXEL_SIZE_M: f32 = 1.0;
+
     let mut obj = String::new();
     writeln!(obj, "# Exported by Voxely")?;
     writeln!(obj, "mtllib {mtl_name}")?;
@@ -154,9 +160,9 @@ pub fn export_obj(path: impl AsRef<Path>, chunk: &Chunk, palette: &Palette) -> R
                 writeln!(
                     obj,
                     "v {} {} {}",
-                    (x as i32 + c[0]) as f32 - ox,
-                    (y as i32 + c[1]) as f32 - oy,
-                    (z as i32 + c[2]) as f32 - oz
+                    ((x as i32 + c[0]) as f32 - ox) * VOXEL_SIZE_M,
+                    ((y as i32 + c[1]) as f32 - oy) * VOXEL_SIZE_M,
+                    ((z as i32 + c[2]) as f32 - oz) * VOXEL_SIZE_M
                 )?;
             }
             for (fi, f) in FACES.iter().enumerate() {

@@ -1,5 +1,4 @@
 use crate::core::Chunk;
-use crate::core::chunk::{CHUNK_WIDTH, CHUNK_HEIGHT, CHUNK_DEPTH};
 use crate::core::Palette;
 use crate::state::Vertex;
 
@@ -16,9 +15,10 @@ pub fn mesh_chunk(chunk: &Chunk, palette: &Palette) -> (Vec<Vertex>, Vec<u32>) {
         let mut q = [0; 3];
         q[axis] = 1;
 
-        let dim_axis = match axis { 0 => CHUNK_WIDTH, 1 => CHUNK_HEIGHT, 2 => CHUNK_DEPTH, _ => unreachable!() };
-        let dim_u = match u { 0 => CHUNK_WIDTH, 1 => CHUNK_HEIGHT, 2 => CHUNK_DEPTH, _ => unreachable!() };
-        let dim_v = match v { 0 => CHUNK_WIDTH, 1 => CHUNK_HEIGHT, 2 => CHUNK_DEPTH, _ => unreachable!() };
+        let dims = [chunk.width, chunk.height, chunk.depth];
+        let dim_axis = dims[axis];
+        let dim_u = dims[u];
+        let dim_v = dims[v];
 
         // Mask for the current slice
         let mut mask = vec![None; dim_u * dim_v];
