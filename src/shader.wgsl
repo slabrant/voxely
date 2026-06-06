@@ -44,3 +44,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 fn fs_line(in: VertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(in.color, 0.5);
 }
+// Translucent overlay used for the hover-face highlight and the ctrl-drag
+// rectangle preview. Alpha is constant; the color carries the intent
+// (blue-ish = place, red-ish = erase).
+@fragment
+fn fs_highlight(in: VertexOutput) -> @location(0) vec4<f32> {
+    return vec4<f32>(in.color, 0.35);
+}

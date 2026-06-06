@@ -22,11 +22,14 @@ pub struct State {
     window: Arc<Window>,
     render_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
+    highlight_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     line_vertex_buffer: wgpu::Buffer,
+    overlay_vertex_buffer: wgpu::Buffer,
     num_indices: u32,
     num_line_indices: u32,
+    num_overlay_vertices: u32,
     camera: Camera,
     camera_uniform: CameraUniform,
     camera_buffer: wgpu::Buffer,
@@ -48,6 +51,29 @@ pub struct State {
     is_redo_pressed: bool,
     last_grid_coord: Option<[i32; 3]>,
     drag_start_voxels: Vec<[i32; 3]>,
+    rect_drag: Option<RectDrag>,
+}
+
+/// State for an in-progress ctrl+left-drag rectangle fill.
+///
+/// The plane is locked when the drag starts: `axis` is the face's normal axis,
+/// `face_world` is the world coordinate of that face's plane (used for preview
+/// rendering and for projecting the cursor ray back onto the plane), and
+/// `place_value` is the cell index along `axis` where voxels are written.
+/// The rectangle spans `start`..`cur` across the two in-plane axes.
+#[derive(Clone, Copy)]
+struct RectDrag {
+    axis: usize,
+    u_axis: usize,
+    v_axis: usize,
+    face_world: f32,
+    normal: [f32; 3],
+    place_value: i32,
+    start_u: i32,
+    start_v: i32,
+    cur_u: i32,
+    cur_v: i32,
+    remove: bool,
 }
 
 pub struct Texture {
@@ -327,6 +353,48 @@ impl State {
             multiview: None,
         });
 
+        // Translucent overlay drawn on top of the scene for the hover-face
+        // highlight and the rectangle preview. Depth-tested (LessEqual) so it
+        // sits on the surface but never writes depth, and alpha-blended.
+        let highlight_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Highlight Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[
+                    Vertex::desc(),
+                ],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_highlight",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: Texture::DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+        });
+
         let depth_texture = Texture::create_depth_texture(&device, &config, "depth_texture");
 
         let camera_controller = CameraController::new();
@@ -408,6 +476,22 @@ impl State {
             }
         );
 
+        // Dynamic overlay buffer (hover highlight / rect preview). Seeded with a
+        // single dummy vertex so the buffer is always valid; the actual contents
+        // are rebuilt as the cursor moves. `num_overlay_vertices` of 0 means
+        // "nothing to draw".
+        let overlay_vertex_buffer = device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Overlay Vertex Buffer"),
+                contents: bytemuck::cast_slice(&[Vertex {
+                    position: [0.0; 3],
+                    color: [0.0; 3],
+                    normal: [0.0; 3],
+                }]),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            }
+        );
+
         Self {
             window,
             surface,
@@ -417,11 +501,14 @@ impl State {
             size,
             render_pipeline,
             line_pipeline,
+            highlight_pipeline,
             vertex_buffer,
             index_buffer,
             line_vertex_buffer,
+            overlay_vertex_buffer,
             num_indices,
             num_line_indices,
+            num_overlay_vertices: 0,
             camera,
             camera_uniform,
             camera_buffer,
@@ -443,6 +530,7 @@ impl State {
             is_redo_pressed: false,
             last_grid_coord: None,
             drag_start_voxels: Vec::new(),
+            rect_drag: None,
         }
     }
 
@@ -471,8 +559,13 @@ impl State {
                 self.camera_controller.handle_mouse_motion(dx, dy);
                 self.cursor_position = *position;
                 if self.is_left_mouse_pressed {
-                    self.handle_drag();
+                    if self.rect_drag.is_some() {
+                        self.update_rect();
+                    } else {
+                        self.handle_drag();
+                    }
                 }
+                self.update_overlay();
                 false
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -480,11 +573,21 @@ impl State {
                     self.is_left_mouse_pressed = *state == winit::event::ElementState::Pressed;
                     if self.is_left_mouse_pressed {
                         self.drag_start_voxels.clear();
-                        self.handle_click();
+                        if self.modifiers.control_key() {
+                            // ctrl(+shift) initiates a plane-locked rectangle fill.
+                            self.begin_rect();
+                        } else {
+                            self.handle_click();
+                        }
                     } else {
+                        // Releasing the button commits any in-progress rectangle.
+                        if self.rect_drag.is_some() {
+                            self.commit_rect();
+                        }
                         self.last_grid_coord = None;
                         self.drag_start_voxels.clear();
                     }
+                    self.update_overlay();
                 }
                 self.camera_controller.process_events(event)
             }
@@ -652,6 +755,174 @@ impl State {
                 self.set_voxel(current_coord[0], current_coord[1], current_coord[2], Voxel { color_index }, false);
                 self.last_grid_coord = Some(current_coord);
             }
+        }
+    }
+
+    /// Casts the cursor ray and starts a rectangle drag, locking the fill plane
+    /// to the face that was hit. Does nothing if the ray misses the world.
+    fn begin_rect(&mut self) {
+        let ray_dir = self.screen_to_ray(self.cursor_position);
+        let ray_origin = self.camera.eye;
+
+        if let Some((pos, normal, _)) = self.raycast(ray_origin, ray_dir) {
+            let axis = if normal[0] != 0.0 {
+                0
+            } else if normal[1] != 0.0 {
+                1
+            } else {
+                2
+            };
+            let u_axis = (axis + 1) % 3;
+            let v_axis = (axis + 2) % 3;
+            let remove = self.modifiers.shift_key();
+            // Erase acts on the hit voxel's own plane; place acts on the cell
+            // one step along the normal.
+            let place_value = if remove { pos[axis] } else { pos[axis] + normal[axis] as i32 };
+            // World plane of the hit face: at the high side of the cell for a
+            // positive normal, the low side for a negative one.
+            let face_world = if normal[axis] > 0.0 {
+                (pos[axis] + 1) as f32
+            } else {
+                pos[axis] as f32
+            };
+
+            let (u, v) = self.project_to_plane(ray_origin, ray_dir, axis, u_axis, v_axis, face_world);
+            self.rect_drag = Some(RectDrag {
+                axis,
+                u_axis,
+                v_axis,
+                face_world,
+                normal,
+                place_value,
+                start_u: u,
+                start_v: v,
+                cur_u: u,
+                cur_v: v,
+                remove,
+            });
+        }
+    }
+
+    /// Updates the moving corner of an in-progress rectangle by projecting the
+    /// cursor ray onto the locked fill plane.
+    fn update_rect(&mut self) {
+        let Some(rd) = self.rect_drag else { return };
+        let ray_dir = self.screen_to_ray(self.cursor_position);
+        let ray_origin = self.camera.eye;
+        let (u, v) = self.project_to_plane(ray_origin, ray_dir, rd.axis, rd.u_axis, rd.v_axis, rd.face_world);
+        if let Some(rd) = &mut self.rect_drag {
+            rd.cur_u = u;
+            rd.cur_v = v;
+        }
+    }
+
+    /// Intersects a ray with the axis-aligned plane `coord[axis] == face_world`
+    /// and returns the in-plane cell indices (clamped to the chunk bounds).
+    fn project_to_plane(
+        &self,
+        origin: glam::Vec3,
+        dir: glam::Vec3,
+        axis: usize,
+        u_axis: usize,
+        v_axis: usize,
+        face_world: f32,
+    ) -> (i32, i32) {
+        use crate::core::chunk::{CHUNK_WIDTH, CHUNK_HEIGHT, CHUNK_DEPTH};
+        let dims = [CHUNK_WIDTH as i32, CHUNK_HEIGHT as i32, CHUNK_DEPTH as i32];
+        let o = origin.to_array();
+        let d = dir.to_array();
+        if d[axis].abs() < 1e-6 {
+            return (0, 0);
+        }
+        let t = (face_world - o[axis]) / d[axis];
+        let p = origin + dir * t;
+        let p = p.to_array();
+        let u = (p[u_axis].floor() as i32).clamp(0, dims[u_axis] - 1);
+        let v = (p[v_axis].floor() as i32).clamp(0, dims[v_axis] - 1);
+        (u, v)
+    }
+
+    /// Writes every cell of the finished rectangle, then clears the drag state.
+    fn commit_rect(&mut self) {
+        let Some(rd) = self.rect_drag.take() else { return };
+        let (u0, u1) = (rd.start_u.min(rd.cur_u), rd.start_u.max(rd.cur_u));
+        let (v0, v1) = (rd.start_v.min(rd.cur_v), rd.start_v.max(rd.cur_v));
+        let color_index = if rd.remove { 0 } else { self.current_color_index };
+        let mut coord = [0i32; 3];
+        coord[rd.axis] = rd.place_value;
+        for u in u0..=u1 {
+            for v in v0..=v1 {
+                coord[rd.u_axis] = u;
+                coord[rd.v_axis] = v;
+                self.set_voxel(coord[0], coord[1], coord[2], Voxel { color_index }, true);
+            }
+        }
+    }
+
+    /// Rebuilds the overlay vertex buffer for the current frame: the rectangle
+    /// preview while dragging, otherwise the hover-face highlight under the
+    /// cursor. Empty when the cursor isn't over the world.
+    fn update_overlay(&mut self) {
+        let mut verts: Vec<Vertex> = Vec::new();
+
+        if let Some(rd) = self.rect_drag {
+            let (u0, u1) = (rd.start_u.min(rd.cur_u), rd.start_u.max(rd.cur_u));
+            let (v0, v1) = (rd.start_v.min(rd.cur_v), rd.start_v.max(rd.cur_v));
+            let color = if rd.remove { [1.0, 0.3, 0.3] } else { [0.4, 0.8, 1.0] };
+            let mut base = [0.0f32; 3];
+            base[rd.axis] = rd.face_world;
+            base[rd.u_axis] = u0 as f32;
+            base[rd.v_axis] = v0 as f32;
+            let mut du = [0.0f32; 3];
+            du[rd.u_axis] = (u1 - u0 + 1) as f32;
+            let mut dv = [0.0f32; 3];
+            dv[rd.v_axis] = (v1 - v0 + 1) as f32;
+            push_overlay_quad(&mut verts, base, du, dv, rd.normal, color);
+        } else if !self.is_left_mouse_pressed {
+            let ray_dir = self.screen_to_ray(self.cursor_position);
+            let ray_origin = self.camera.eye;
+            if let Some((pos, normal, _)) = self.raycast(ray_origin, ray_dir) {
+                let axis = if normal[0] != 0.0 {
+                    0
+                } else if normal[1] != 0.0 {
+                    1
+                } else {
+                    2
+                };
+                let u_axis = (axis + 1) % 3;
+                let v_axis = (axis + 2) % 3;
+                let face_world = if normal[axis] > 0.0 {
+                    (pos[axis] + 1) as f32
+                } else {
+                    pos[axis] as f32
+                };
+                let color = if self.modifiers.shift_key() {
+                    [1.0, 0.3, 0.3]
+                } else {
+                    [1.0, 1.0, 1.0]
+                };
+                let mut base = [0.0f32; 3];
+                base[axis] = face_world;
+                base[u_axis] = pos[u_axis] as f32;
+                base[v_axis] = pos[v_axis] as f32;
+                let mut du = [0.0f32; 3];
+                du[u_axis] = 1.0;
+                let mut dv = [0.0f32; 3];
+                dv[v_axis] = 1.0;
+                push_overlay_quad(&mut verts, base, du, dv, normal, color);
+            }
+        }
+
+        self.num_overlay_vertices = verts.len() as u32;
+        if !verts.is_empty() {
+            use wgpu::util::DeviceExt;
+            self.overlay_vertex_buffer = self.device.create_buffer_init(
+                &wgpu::util::BufferInitDescriptor {
+                    label: Some("Overlay Vertex Buffer"),
+                    contents: bytemuck::cast_slice(&verts),
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                },
+            );
         }
     }
 
@@ -988,6 +1259,13 @@ impl State {
             render_pass.set_pipeline(&self.line_pipeline);
             render_pass.set_vertex_buffer(0, self.line_vertex_buffer.slice(..));
             render_pass.draw(0..self.num_line_indices, 0..1);
+
+            // Draw the hover/rectangle overlay on top of the scene.
+            if self.num_overlay_vertices > 0 {
+                render_pass.set_pipeline(&self.highlight_pipeline);
+                render_pass.set_vertex_buffer(0, self.overlay_vertex_buffer.slice(..));
+                render_pass.draw(0..self.num_overlay_vertices, 0..1);
+            }
         }
 
         // UI pass: draws egui on top, preserving the scene (LoadOp::Load).
@@ -1112,6 +1390,42 @@ impl State {
                 ui.label("Shift + Left-click: remove");
                 ui.label("Right-drag: orbit");
                 ui.label("Middle-drag: pan · Scroll: zoom");
+                ui.label("Ctrl + Left-drag: fill rectangle");
+                ui.label("Ctrl + Shift + Left-drag: erase rectangle");
             });
     }
+}
+
+/// Appends two triangles forming the quad `base + s*du + t*dv` (s,t ∈ [0,1]),
+/// nudged `0.02` along `normal` so the translucent overlay sits just in front
+/// of the surface and avoids z-fighting.
+fn push_overlay_quad(
+    verts: &mut Vec<Vertex>,
+    base: [f32; 3],
+    du: [f32; 3],
+    dv: [f32; 3],
+    normal: [f32; 3],
+    color: [f32; 3],
+) {
+    let off = 0.02;
+    let b = [
+        base[0] + normal[0] * off,
+        base[1] + normal[1] * off,
+        base[2] + normal[2] * off,
+    ];
+    let p = |s: f32, t: f32| Vertex {
+        position: [
+            b[0] + du[0] * s + dv[0] * t,
+            b[1] + du[1] * s + dv[1] * t,
+            b[2] + du[2] * s + dv[2] * t,
+        ],
+        color,
+        normal: [0.0; 3],
+    };
+    verts.push(p(0.0, 0.0));
+    verts.push(p(1.0, 0.0));
+    verts.push(p(1.0, 1.0));
+    verts.push(p(0.0, 0.0));
+    verts.push(p(1.0, 1.0));
+    verts.push(p(0.0, 1.0));
 }
