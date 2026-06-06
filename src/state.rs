@@ -1198,6 +1198,21 @@ impl State {
         self.last_grid_coord = None;
         self.rect_drag = None;
         self.sync_to_chunk();
+        self.frame_camera_to_chunk();
+    }
+
+    /// Points the camera at the centre of the current canvas and pulls the eye
+    /// back far enough to see the whole bounding box, so a resize is immediately
+    /// visible. The orbit/pan controller only applies deltas, so this sticks.
+    fn frame_camera_to_chunk(&mut self) {
+        let (w, h, d) = (self.chunk.width as f32, self.chunk.height as f32, self.chunk.depth as f32);
+        let center = glam::Vec3::new(w * 0.5, h * 0.5, d * 0.5);
+        let radius = center.length();
+        // Keep the current viewing direction; just re-distance from the centre.
+        let dir = (self.camera.eye - self.camera.target).normalize_or_zero();
+        let dir = if dir == glam::Vec3::ZERO { glam::Vec3::new(1.0, 0.8, 1.0).normalize() } else { dir };
+        self.camera.target = center;
+        self.camera.eye = center + dir * (radius * 2.5).max(3.0);
     }
 
     /// Rebuilds canvas-dependent GPU state (mesh + bounding box) and resets the
@@ -1428,6 +1443,9 @@ impl State {
             .resizable(false)
             .default_width(210.0)
             .show(ctx, |ui| {
+              // Scroll so every control stays reachable even when the window is
+              // shorter than the full panel.
+              egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.heading("Voxely");
                 ui.separator();
 
@@ -1479,28 +1497,33 @@ impl State {
 
                 ui.add_space(6.0);
                 ui.label(format!(
-                    "Canvas size ({}×{}×{})",
+                    "Canvas: {}×{}×{}",
                     self.chunk.width, self.chunk.height, self.chunk.depth
                 ));
                 let max = crate::core::chunk::MAX_CHUNK_SIZE;
-                ui.horizontal(|ui| {
-                    for (i, axis) in ["W", "H", "D"].iter().enumerate() {
-                        ui.label(*axis);
-                        ui.add(
+                // Apply when a field is committed (Enter / click-away / end of a
+                // drag) or the button is pressed, so editing a size actually
+                // takes effect without depending on a separate click.
+                let mut commit = false;
+                for (i, name) in ["Width", "Height", "Depth"].iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{name}:"));
+                        let resp = ui.add(
                             egui::DragValue::new(&mut self.pending_size[i])
                                 .clamp_range(1..=max)
-                                .speed(0.25),
+                                .speed(0.2),
                         );
-                    }
-                });
-                let [pw, ph, pd] = self.pending_size;
-                let changed = [pw, ph, pd]
-                    != [self.chunk.width, self.chunk.height, self.chunk.depth];
-                if ui
-                    .add_enabled(changed, egui::Button::new("Resize canvas"))
-                    .clicked()
-                {
-                    self.resize_canvas(pw, ph, pd);
+                        if resp.lost_focus() || resp.drag_stopped() {
+                            commit = true;
+                        }
+                    });
+                }
+                if ui.button("Apply size").clicked() {
+                    commit = true;
+                }
+                let p = self.pending_size;
+                if commit && p != [self.chunk.width, self.chunk.height, self.chunk.depth] {
+                    self.resize_canvas(p[0], p[1], p[2]);
                 }
 
                 ui.separator();
@@ -1561,6 +1584,7 @@ impl State {
                 ui.label("Ctrl + Shift + Left-drag: erase rectangle");
                 ui.label("B: toggle brush/bucket");
                 ui.label("Bucket click: fill region · Shift: erase region");
+              });
             });
     }
 }
