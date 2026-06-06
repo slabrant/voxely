@@ -1,38 +1,99 @@
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::Write as _;
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
-
 use crate::core::{Chunk, Palette, Voxel};
 
-/// Everything persisted in a native `.voxely` project file.
-#[derive(Serialize, Deserialize)]
+/// An opened model: the voxel grid plus its palette. This is what every loader
+/// returns and what the editor swaps in.
 pub struct Project {
     pub chunk: Chunk,
     pub palette: Palette,
 }
 
-/// Save the current chunk and palette to a native project file.
-pub fn save_project(path: impl AsRef<Path>, chunk: &Chunk, palette: &Palette) -> Result<(), Box<dyn Error>> {
-    let project = ProjectRef { chunk, palette };
-    let bytes = bincode::serialize(&project)?;
-    std::fs::write(path, bytes)?;
+/// Open a model file, dispatching on its extension. `.vox` is the native,
+/// lossless format (voxel grid + palette); `.obj` is a best-effort import of a
+/// mesh we previously exported (one cube per voxel).
+pub fn open(path: impl AsRef<Path>) -> Result<Project, Box<dyn Error>> {
+    let path = path.as_ref();
+    match path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
+        Some("vox") => load_vox(path),
+        Some("obj") => load_obj(path),
+        other => Err(format!("unsupported file type: {}", other.unwrap_or("(none)")).into()),
+    }
+}
+
+/// Save the chunk and palette losslessly to a MagicaVoxel `.vox` file. This is
+/// the native project format: it stores the voxel grid and real color palette,
+/// round-trips through [`load_vox`], and opens in MagicaVoxel and most engines.
+///
+/// We are Y-up while `.vox` is Z-up, so engine `(x, y, z)` is written as vox
+/// `(x, z, y)` — the inverse of the swap [`load_vox`] applies on the way in.
+pub fn save_vox(path: impl AsRef<Path>, chunk: &Chunk, palette: &Palette) -> Result<(), Box<dyn Error>> {
+    // `.vox` coordinates are single bytes, so each dimension must fit in 0..=256
+    // (indices 0..=255). The editor caps dimensions well below this already.
+    if chunk.width > 256 || chunk.height > 256 || chunk.depth > 256 {
+        return Err("chunk is too large to save as .vox (max 256 per axis)".into());
+    }
+
+    let mut voxels = Vec::new();
+    for x in 0..chunk.width {
+        for y in 0..chunk.height {
+            for z in 0..chunk.depth {
+                if let Some(v) = chunk.get(x, y, z) {
+                    if !v.is_empty() {
+                        // engine (x, y, z) Y-up -> vox (x, z, y) Z-up; color
+                        // index 1..=255 becomes vox 0-based `i` = index - 1.
+                        voxels.push(dot_vox::Voxel {
+                            x: x as u8,
+                            y: z as u8,
+                            z: y as u8,
+                            i: v.color_index - 1,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // 256-color RGBA table written 1:1 with our palette. `load_vox` (mirroring
+    // dot_vox's default index map, which maps in-memory index i -> slot i + 1)
+    // reads our color index C straight back from `data.palette[C]`, so writing
+    // slot-for-slot makes the palette round-trip exactly.
+    let pal = (0..256)
+        .map(|k| {
+            let c = palette.colors.get(k).copied().unwrap_or([0, 0, 0, 255]);
+            dot_vox::Color { r: c[0], g: c[1], b: c[2], a: c[3] }
+        })
+        .collect();
+
+    let data = dot_vox::DotVoxData {
+        version: 150,
+        index_map: Vec::new(),
+        models: vec![dot_vox::Model {
+            size: dot_vox::Size {
+                x: chunk.width as u32,
+                y: chunk.depth as u32,
+                z: chunk.height as u32,
+            },
+            voxels,
+        }],
+        palette: pal,
+        materials: Vec::new(),
+        scenes: Vec::new(),
+        layers: Vec::new(),
+    };
+
+    let mut file = std::fs::File::create(path)?;
+    data.write_vox(&mut file)?;
     Ok(())
 }
 
-/// Load a native project file. Returns an error (rather than panicking) on a
-/// missing file or an incompatible/old format.
-pub fn load_project(path: impl AsRef<Path>) -> Result<Project, Box<dyn Error>> {
-    let bytes = std::fs::read(path)?;
-    let project = bincode::deserialize(&bytes)?;
-    Ok(project)
-}
-
-/// Import a MagicaVoxel `.vox` file into a project, bringing along its real
-/// color palette. MagicaVoxel is Z-up, so Y and Z are swapped to match our
-/// Y-up engine. Color indices are shifted by one so index 0 stays "empty".
-pub fn import_vox(path: impl AsRef<Path>) -> Result<Project, Box<dyn Error>> {
+/// Load a MagicaVoxel `.vox` file, bringing along its real color palette.
+/// MagicaVoxel is Z-up, so Y and Z are swapped to match our Y-up engine. Color
+/// indices are shifted by one so index 0 stays "empty".
+pub fn load_vox(path: impl AsRef<Path>) -> Result<Project, Box<dyn Error>> {
     let path = path.as_ref();
     let data = dot_vox::load(path.to_str().ok_or("non-UTF-8 path")?)
         .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
@@ -48,7 +109,12 @@ pub fn import_vox(path: impl AsRef<Path>) -> Result<Project, Box<dyn Error>> {
         }
     }
 
-    let mut chunk = Chunk::new();
+    // Size the chunk to the model so nothing is silently clipped.
+    let mut chunk = Chunk::with_size(
+        (model.size.x as usize).max(1),
+        (model.size.z as usize).max(1),
+        (model.size.y as usize).max(1),
+    );
     let mut dropped = 0usize;
     for v in &model.voxels {
         let color_index = v.i.saturating_add(1);
@@ -59,12 +125,139 @@ pub fn import_vox(path: impl AsRef<Path>) -> Result<Project, Box<dyn Error>> {
     }
     if dropped > 0 {
         log::warn!(
-            "{dropped} voxels were outside the {}x{}x{} chunk and were dropped on import",
+            "{dropped} voxels were outside the {}x{}x{} chunk and were dropped on load",
             chunk.width, chunk.height, chunk.depth
         );
     }
 
     Ok(Project { chunk, palette })
+}
+
+/// Best-effort import of a Wavefront `.obj` we previously exported: one cube
+/// per voxel, eight vertices each, grouped by `usemtl matN`. Foreign meshes may
+/// not reconstruct cleanly — `.vox` is the format for round-tripping.
+///
+/// Colors come from the companion `.mtl` (`newmtl matN` + `Kd`), so the
+/// original palette indices are recovered when present.
+pub fn load_obj(path: impl AsRef<Path>) -> Result<Project, Box<dyn Error>> {
+    let path = path.as_ref();
+    let text = std::fs::read_to_string(path)?;
+
+    // material name -> palette index, from the companion .mtl. Falls back to
+    // sequential indices for any material we can't map.
+    let mtl_colors = read_mtl(&path.with_extension("mtl")).unwrap_or_default();
+    let mut palette = Palette::default();
+    for (&idx, &color) in &mtl_colors {
+        if let Some(slot) = palette.colors.get_mut(idx as usize) {
+            *slot = color;
+        }
+    }
+
+    // Walk the file in order, tracking the active material, collecting vertices.
+    // Every eight vertices form one exported cube.
+    let mut cur_color = 1u8;
+    let mut next_seq = 1u8; // for materials that aren't named "matN"
+    let mut seq_map: HashMap<String, u8> = HashMap::new();
+    let mut verts: Vec<[f32; 3]> = Vec::new();
+    let mut cubes: Vec<([f32; 3], u8)> = Vec::new(); // (min corner, color index)
+
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        match it.next() {
+            Some("usemtl") => {
+                let name = it.next().unwrap_or("");
+                cur_color = name
+                    .strip_prefix("mat")
+                    .and_then(|n| n.parse::<u8>().ok())
+                    .unwrap_or_else(|| {
+                        *seq_map.entry(name.to_string()).or_insert_with(|| {
+                            let c = next_seq;
+                            next_seq = next_seq.saturating_add(1);
+                            c
+                        })
+                    });
+            }
+            Some("v") => {
+                let coords: Vec<f32> = it.filter_map(|t| t.parse().ok()).collect();
+                if coords.len() >= 3 {
+                    verts.push([coords[0], coords[1], coords[2]]);
+                    if verts.len() == 8 {
+                        let min = verts.iter().fold([f32::INFINITY; 3], |a, v| {
+                            [a[0].min(v[0]), a[1].min(v[1]), a[2].min(v[2])]
+                        });
+                        cubes.push((min, cur_color));
+                        verts.clear();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if cubes.is_empty() {
+        return Err("no voxels could be reconstructed from the .obj".into());
+    }
+
+    // Re-anchor to a non-negative integer grid: subtract the global minimum
+    // corner and round. (Export re-origins to the bottom-center, so corners can
+    // be fractional and negative.)
+    let gmin = cubes.iter().fold([f32::INFINITY; 3], |a, (m, _)| {
+        [a[0].min(m[0]), a[1].min(m[1]), a[2].min(m[2])]
+    });
+    let cells: Vec<([usize; 3], u8)> = cubes
+        .iter()
+        .map(|(m, c)| {
+            (
+                [
+                    (m[0] - gmin[0]).round().max(0.0) as usize,
+                    (m[1] - gmin[1]).round().max(0.0) as usize,
+                    (m[2] - gmin[2]).round().max(0.0) as usize,
+                ],
+                *c,
+            )
+        })
+        .collect();
+
+    let dims = cells.iter().fold([0usize; 3], |a, (p, _)| {
+        [a[0].max(p[0] + 1), a[1].max(p[1] + 1), a[2].max(p[2] + 1)]
+    });
+    let mut chunk = Chunk::with_size(dims[0], dims[1], dims[2]);
+    for (p, color_index) in cells {
+        chunk.set(p[0], p[1], p[2], Voxel { color_index });
+    }
+
+    Ok(Project { chunk, palette })
+}
+
+/// Parse `newmtl matN` / `Kd r g b` pairs into a map of palette index -> color.
+/// Only materials named `matN` are mapped (that's how [`export_obj`] names them).
+fn read_mtl(path: &Path) -> Option<HashMap<u8, [u8; 4]>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut map = HashMap::new();
+    let mut cur: Option<u8> = None;
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        match it.next() {
+            Some("newmtl") => {
+                cur = it.next().and_then(|n| n.strip_prefix("mat")).and_then(|n| n.parse().ok());
+            }
+            Some("Kd") => {
+                if let Some(idx) = cur {
+                    let c: Vec<f32> = it.filter_map(|t| t.parse().ok()).collect();
+                    if c.len() >= 3 {
+                        map.insert(idx, [
+                            (c[0] * 255.0).round() as u8,
+                            (c[1] * 255.0).round() as u8,
+                            (c[2] * 255.0).round() as u8,
+                            255,
+                        ]);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(map)
 }
 
 /// Export the chunk to a Wavefront `.obj` file (plus a companion `.mtl` with one
@@ -198,13 +391,6 @@ pub fn export_obj(path: impl AsRef<Path>, chunk: &Chunk, palette: &Palette) -> R
     Ok(())
 }
 
-/// Borrowed mirror of [`Project`] so saving doesn't need to clone the chunk.
-#[derive(Serialize)]
-struct ProjectRef<'a> {
-    chunk: &'a Chunk,
-    palette: &'a Palette,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,16 +459,45 @@ mod tests {
     }
 
     #[test]
-    fn save_then_load_round_trips() {
-        let mut chunk = Chunk::new();
-        chunk.set(1, 1, 1, Voxel { color_index: 7 });
+    fn save_then_load_vox_round_trips() {
+        let mut chunk = Chunk::with_size(8, 8, 8);
+        chunk.set(1, 2, 3, Voxel { color_index: 7 });
+        chunk.set(5, 0, 6, Voxel { color_index: 3 });
         let palette = Palette::default();
 
-        let path = std::env::temp_dir().join("voxely_test_project.voxely");
-        save_project(&path, &chunk, &palette).expect("save should succeed");
-        let loaded = load_project(&path).expect("load should succeed");
+        let path = std::env::temp_dir().join("voxely_test_project.vox");
+        save_vox(&path, &chunk, &palette).expect("save should succeed");
+        let loaded = load_vox(&path).expect("load should succeed");
 
-        assert_eq!(loaded.chunk.get(1, 1, 1).unwrap().color_index, 7);
+        assert_eq!(loaded.chunk.get(1, 2, 3).unwrap().color_index, 7);
+        assert_eq!(loaded.chunk.get(5, 0, 6).unwrap().color_index, 3);
+        // The palette colors for the used indices survive the round-trip.
+        assert_eq!(loaded.palette.colors[7], palette.colors[7]);
+        assert_eq!(loaded.palette.colors[3], palette.colors[3]);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn export_then_load_obj_round_trips_shape_and_color() {
+        let mut chunk = Chunk::with_size(10, 10, 10);
+        chunk.set(2, 0, 1, Voxel { color_index: 4 });
+        chunk.set(3, 0, 1, Voxel { color_index: 4 });
+        chunk.set(2, 1, 1, Voxel { color_index: 7 });
+        let palette = Palette::default();
+
+        let path = std::env::temp_dir().join("voxely_test_obj_roundtrip.obj");
+        export_obj(&path, &chunk, &palette).expect("export should succeed");
+        let loaded = load_obj(&path).expect("load should succeed");
+
+        // Shape is re-anchored to the origin: the lowest/leftmost voxel moves to
+        // (0,0,0), so relative layout is what we check.
+        let count = (0..loaded.chunk.width)
+            .flat_map(|x| (0..loaded.chunk.height).flat_map(move |y| (0..loaded.chunk.depth).map(move |z| (x, y, z))))
+            .filter(|&(x, y, z)| loaded.chunk.get(x, y, z).map(|v| !v.is_empty()).unwrap_or(false))
+            .count();
+        assert_eq!(count, 3, "all three voxels survive the obj round-trip");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("mtl"));
     }
 }

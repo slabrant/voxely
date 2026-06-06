@@ -9,7 +9,8 @@ an [egui](https://www.egui.rs/) side panel.
 - Cursor face highlight showing where the next voxel lands
 - 64-color palette with live recoloring, and full undo/redo (one step per action)
 - Resizable canvas (W×H×D) from the UI
-- Save/load native `.voxely` projects, import MagicaVoxel `.vox`
+- Save/Open native MagicaVoxel `.vox` projects (lossless voxel grid + palette);
+  Open also accepts a previously exported `.obj` (best-effort)
 - Export to Wavefront `.obj` (+ `.mtl`) via a native save dialog — flat-shaded,
   1 m blocks, origin at the model's bottom-center
 
@@ -56,8 +57,8 @@ cargo build --release --target x86_64-pc-windows-gnu
 | Pick color | `1`–`9`, or click a palette swatch |
 | Orbit / pan / zoom | Right-drag / middle-drag / scroll |
 | Undo / redo | Ctrl+Z / Ctrl+Y |
-| Save / load | Ctrl+S / Ctrl+L |
-| Import `.vox` / export `.obj` | Ctrl+I / Ctrl+E |
+| Save `.vox` / open | Ctrl+S / Ctrl+O |
+| Export `.obj` | Ctrl+E |
 
 Tools, history, file actions, canvas size, and the palette are also available in
 the left-hand panel.

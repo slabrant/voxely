@@ -9,7 +9,8 @@ use winit::{
     window::Window,
 };
 
-const PROJECT_PATH: &str = "project.voxely";
+/// Default file name suggested in the "Save" dialog. `.vox` is the native,
+/// lossless project format; `.obj` is export-only (see `crate::io`).
 const VOX_PATH: &str = "model.vox";
 const OBJ_PATH: &str = "model.obj";
 
@@ -613,8 +614,7 @@ impl State {
                             return true;
                         }
                         KeyCode::KeyS if ctrl && !*repeat => { self.save_project(); return true; }
-                        KeyCode::KeyL if ctrl && !*repeat => { self.load_project(); return true; }
-                        KeyCode::KeyI if ctrl && !*repeat => { self.import_vox(); return true; }
+                        KeyCode::KeyO if ctrl && !*repeat => { self.open_file(); return true; }
                         KeyCode::KeyE if ctrl && !*repeat => { self.export_obj(); return true; }
                         KeyCode::KeyZ if ctrl => {
                             if !self.is_undo_pressed {
@@ -1256,36 +1256,42 @@ impl State {
         self.num_indices = mesh_indices.len() as u32;
     }
 
+    /// Save the model as a native, lossless `.vox` file via a "save as" dialog.
     fn save_project(&self) {
-        match crate::io::save_project(PROJECT_PATH, &self.chunk, &self.palette) {
-            Ok(()) => println!("Saved {PROJECT_PATH}"),
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Save as .vox")
+            .add_filter("MagicaVoxel", &["vox"])
+            .set_file_name(VOX_PATH)
+            .save_file()
+        else {
+            return; // user cancelled
+        };
+        match crate::io::save_vox(&path, &self.chunk, &self.palette) {
+            Ok(()) => println!("Saved {}", path.display()),
             Err(e) => eprintln!("Save failed: {e}"),
         }
     }
 
-    fn load_project(&mut self) {
-        match crate::io::load_project(PROJECT_PATH) {
+    /// Open a `.vox` (native) or `.obj` (best-effort) model via a file picker.
+    fn open_file(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Open model")
+            .add_filter("Voxel models", &["vox", "obj"])
+            .add_filter("MagicaVoxel", &["vox"])
+            .add_filter("Wavefront OBJ", &["obj"])
+            .pick_file()
+        else {
+            return; // user cancelled
+        };
+        match crate::io::open(&path) {
             Ok(project) => {
                 self.chunk = project.chunk;
                 self.palette = project.palette;
                 self.history.clear();
                 self.sync_to_chunk();
-                println!("Loaded {PROJECT_PATH}");
+                println!("Opened {}", path.display());
             }
-            Err(e) => eprintln!("Load failed: {e}"),
-        }
-    }
-
-    fn import_vox(&mut self) {
-        match crate::io::import_vox(VOX_PATH) {
-            Ok(project) => {
-                self.chunk = project.chunk;
-                self.palette = project.palette;
-                self.history.clear();
-                self.sync_to_chunk();
-                println!("Imported {VOX_PATH}");
-            }
-            Err(e) => eprintln!("Import failed: {e}"),
+            Err(e) => eprintln!("Open failed: {e}"),
         }
     }
 
@@ -1482,13 +1488,8 @@ impl State {
                     if ui.button("Save").clicked() {
                         self.save_project();
                     }
-                    if ui.button("Load").clicked() {
-                        self.load_project();
-                    }
-                });
-                ui.horizontal(|ui| {
-                    if ui.button("Import .vox").clicked() {
-                        self.import_vox();
+                    if ui.button("Open").clicked() {
+                        self.open_file();
                     }
                     if ui.button("Export .obj").clicked() {
                         self.export_obj();
