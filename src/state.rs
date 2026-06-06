@@ -56,6 +56,9 @@ pub struct State {
     tool: Tool,
     /// Canvas dimensions edited in the UI, applied on "Resize".
     pending_size: [usize; 3],
+    /// Path of the current `.vox` project, if it has been saved/opened. `Save`
+    /// writes here silently; `Save As` (or saving when this is `None`) prompts.
+    current_path: Option<std::path::PathBuf>,
 }
 
 /// The active editing tool, chosen from the UI or with a hotkey.
@@ -515,6 +518,7 @@ impl State {
             rect_drag: None,
             tool: Tool::Brush,
             pending_size: [chunk_w, chunk_h, chunk_d],
+            current_path: None,
         }
     }
 
@@ -613,6 +617,7 @@ impl State {
                             self.tool = if self.tool == Tool::Bucket { Tool::Brush } else { Tool::Bucket };
                             return true;
                         }
+                        KeyCode::KeyS if ctrl && self.modifiers.shift_key() && !*repeat => { self.save_project_as(); return true; }
                         KeyCode::KeyS if ctrl && !*repeat => { self.save_project(); return true; }
                         KeyCode::KeyO if ctrl && !*repeat => { self.open_file(); return true; }
                         KeyCode::KeyE if ctrl && !*repeat => { self.export_obj(); return true; }
@@ -1256,18 +1261,42 @@ impl State {
         self.num_indices = mesh_indices.len() as u32;
     }
 
-    /// Save the model as a native, lossless `.vox` file via a "save as" dialog.
-    fn save_project(&self) {
+    /// Save to the current `.vox` path without prompting, falling back to
+    /// `Save As` the first time (or after opening a non-`.vox` file).
+    fn save_project(&mut self) {
+        match self.current_path.clone() {
+            Some(path) => self.write_vox(&path),
+            None => self.save_project_as(),
+        }
+    }
+
+    /// Save the model as a native, lossless `.vox` file via a "save as" dialog,
+    /// remembering the chosen path for subsequent plain `Save`s.
+    fn save_project_as(&mut self) {
+        let suggested = self
+            .current_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or(VOX_PATH);
         let Some(path) = rfd::FileDialog::new()
             .set_title("Save as .vox")
             .add_filter("MagicaVoxel", &["vox"])
-            .set_file_name(VOX_PATH)
+            .set_file_name(suggested)
             .save_file()
         else {
             return; // user cancelled
         };
-        match crate::io::save_vox(&path, &self.chunk, &self.palette) {
-            Ok(()) => println!("Saved {}", path.display()),
+        self.write_vox(&path);
+    }
+
+    /// Write the `.vox` to `path` and adopt it as the current project path.
+    fn write_vox(&mut self, path: &std::path::Path) {
+        match crate::io::save_vox(path, &self.chunk, &self.palette) {
+            Ok(()) => {
+                println!("Saved {}", path.display());
+                self.current_path = Some(path.to_path_buf());
+            }
             Err(e) => eprintln!("Save failed: {e}"),
         }
     }
@@ -1290,6 +1319,13 @@ impl State {
                 self.history.clear();
                 self.sync_to_chunk();
                 println!("Opened {}", path.display());
+                // Only adopt the path for silent `Save` if it's a native `.vox`;
+                // an opened `.obj` should prompt (Save always writes `.vox`).
+                let is_vox = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("vox"));
+                self.current_path = is_vox.then(|| path.clone());
             }
             Err(e) => eprintln!("Open failed: {e}"),
         }
@@ -1445,6 +1481,7 @@ impl State {
     }
 
     fn build_ui(&mut self, ctx: &egui::Context) {
+        self.build_menu_bar(ctx);
         egui::SidePanel::left("controls_panel")
             .resizable(false)
             .default_width(210.0)
@@ -1483,49 +1520,10 @@ impl State {
                 });
 
                 ui.add_space(6.0);
-                ui.label("File");
-                ui.horizontal(|ui| {
-                    if ui.button("Save").clicked() {
-                        self.save_project();
-                    }
-                    if ui.button("Open").clicked() {
-                        self.open_file();
-                    }
-                    if ui.button("Export .obj").clicked() {
-                        self.export_obj();
-                    }
-                });
-
-                ui.add_space(6.0);
                 ui.label(format!(
                     "Canvas: {}×{}×{}",
                     self.chunk.width, self.chunk.height, self.chunk.depth
                 ));
-                let max = crate::core::chunk::MAX_CHUNK_SIZE;
-                // Apply when a field is committed (Enter / click-away / end of a
-                // drag) or the button is pressed, so editing a size actually
-                // takes effect without depending on a separate click.
-                let mut commit = false;
-                for (i, name) in ["Width", "Height", "Depth"].iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("{name}:"));
-                        let resp = ui.add(
-                            egui::DragValue::new(&mut self.pending_size[i])
-                                .clamp_range(1..=max)
-                                .speed(0.2),
-                        );
-                        if resp.lost_focus() || resp.drag_stopped() {
-                            commit = true;
-                        }
-                    });
-                }
-                if ui.button("Apply size").clicked() {
-                    commit = true;
-                }
-                let p = self.pending_size;
-                if commit && p != [self.chunk.width, self.chunk.height, self.chunk.depth] {
-                    self.resize_canvas(p[0], p[1], p[2]);
-                }
 
                 ui.separator();
                 ui.label(format!("Active color: #{}", self.current_color_index));
@@ -1575,18 +1573,72 @@ impl State {
                         }
                     });
                 }
-
-                ui.separator();
-                ui.label("Left-click: place");
-                ui.label("Shift + Left-click: remove");
-                ui.label("Right-drag: orbit");
-                ui.label("Middle-drag: pan · Scroll: zoom");
-                ui.label("Ctrl + Left-drag: fill rectangle");
-                ui.label("Ctrl + Shift + Left-drag: erase rectangle");
-                ui.label("B: toggle brush/bucket");
-                ui.label("Bucket click: fill region · Shift: erase region");
               });
             });
+    }
+
+    /// The top menu bar: File (open/save/export), Edit (canvas extents), and
+    /// Help (controls reference).
+    fn build_menu_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+            egui::menu::bar(ui, |ui| {
+                ui.menu_button("File", |ui| {
+                    if ui.button("Open…").clicked() {
+                        self.open_file();
+                        ui.close_menu();
+                    }
+                    if ui.button("Save").clicked() {
+                        self.save_project();
+                        ui.close_menu();
+                    }
+                    if ui.button("Save As…").clicked() {
+                        self.save_project_as();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Export .obj…").clicked() {
+                        self.export_obj();
+                        ui.close_menu();
+                    }
+                });
+
+                ui.menu_button("Edit", |ui| {
+                    ui.label("Canvas extents");
+                    let max = crate::core::chunk::MAX_CHUNK_SIZE;
+                    // Apply when a field is committed (Enter / click-away / end of
+                    // a drag), so editing a size takes effect on its own.
+                    let mut commit = false;
+                    for (i, name) in ["Width", "Height", "Depth"].iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("{name}:"));
+                            let resp = ui.add(
+                                egui::DragValue::new(&mut self.pending_size[i])
+                                    .clamp_range(1..=max)
+                                    .speed(0.2),
+                            );
+                            if resp.lost_focus() || resp.drag_stopped() {
+                                commit = true;
+                            }
+                        });
+                    }
+                    let p = self.pending_size;
+                    if commit && p != [self.chunk.width, self.chunk.height, self.chunk.depth] {
+                        self.resize_canvas(p[0], p[1], p[2]);
+                    }
+                });
+
+                ui.menu_button("Help", |ui| {
+                    ui.label("Left-click: place");
+                    ui.label("Shift + Left-click: remove");
+                    ui.label("Right-drag: orbit");
+                    ui.label("Middle-drag: pan · Scroll: zoom");
+                    ui.label("Ctrl + Left-drag: fill rectangle");
+                    ui.label("Ctrl + Shift + Left-drag: erase rectangle");
+                    ui.label("B: toggle brush/bucket");
+                    ui.label("Bucket click: fill region · Shift: erase region");
+                });
+            });
+        });
     }
 }
 

@@ -28,7 +28,12 @@ pub const ACTION_REPEAT_DELAY: std::time::Duration = std::time::Duration::from_m
     println!("--------------------------");
 
     let event_loop = EventLoop::new().unwrap();
-    let window = Arc::new(WindowBuilder::new().build(&event_loop).unwrap());
+    let window = Arc::new(
+        WindowBuilder::new()
+            .with_title("Voxely")
+            .build(&event_loop)
+            .unwrap(),
+    );
 
     let mut state = state::State::new(Arc::clone(&window)).await;
     let window_id = window.id();
@@ -41,16 +46,7 @@ pub const ACTION_REPEAT_DELAY: std::time::Duration = std::time::Duration::from_m
             } if id == window_id => {
                 if !state.input(event) {
                     match event {
-                        WindowEvent::CloseRequested
-                        | WindowEvent::KeyboardInput {
-                            event:
-                                KeyEvent {
-                                    state: ElementState::Pressed,
-                                    physical_key: winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Escape),
-                                    ..
-                                },
-                            ..
-                        } => elwt.exit(),
+                        WindowEvent::CloseRequested => elwt.exit(),
                         WindowEvent::Resized(physical_size) => {
                             state.resize(*physical_size);
                         }

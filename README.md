@@ -57,8 +57,10 @@ cargo build --release --target x86_64-pc-windows-gnu
 | Pick color | `1`–`9`, or click a palette swatch |
 | Orbit / pan / zoom | Right-drag / middle-drag / scroll |
 | Undo / redo | Ctrl+Z / Ctrl+Y |
-| Save `.vox` / open | Ctrl+S / Ctrl+O |
+| Save / Save As / open | Ctrl+S / Ctrl+Shift+S / Ctrl+O |
 | Export `.obj` | Ctrl+E |
+
+File, Edit (canvas extents), and Help live in the top menu bar.
 
 Tools, history, file actions, canvas size, and the palette are also available in
 the left-hand panel.
