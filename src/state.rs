@@ -1301,13 +1301,11 @@ impl State {
         }
     }
 
-    /// Open a `.vox` (native) or `.obj` (best-effort) model via a file picker.
+    /// Open a native `.vox` model (voxel grid + palette) via a file picker.
     fn open_file(&mut self) {
         let Some(path) = rfd::FileDialog::new()
-            .set_title("Open model")
-            .add_filter("Voxel models", &["vox", "obj"])
+            .set_title("Open .vox")
             .add_filter("MagicaVoxel", &["vox"])
-            .add_filter("Wavefront OBJ", &["obj"])
             .pick_file()
         else {
             return; // user cancelled
@@ -1319,13 +1317,7 @@ impl State {
                 self.history.clear();
                 self.sync_to_chunk();
                 println!("Opened {}", path.display());
-                // Only adopt the path for silent `Save` if it's a native `.vox`;
-                // an opened `.obj` should prompt (Save always writes `.vox`).
-                let is_vox = path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .is_some_and(|e| e.eq_ignore_ascii_case("vox"));
-                self.current_path = is_vox.then(|| path.clone());
+                self.current_path = Some(path.clone());
             }
             Err(e) => eprintln!("Open failed: {e}"),
         }

@@ -9,10 +9,10 @@ an [egui](https://www.egui.rs/) side panel.
 - Cursor face highlight showing where the next voxel lands
 - 64-color palette with live recoloring, and full undo/redo (one step per action)
 - Resizable canvas (W×H×D) from the UI
-- Save/Open native MagicaVoxel `.vox` projects (lossless voxel grid + palette);
-  Open also accepts a previously exported `.obj` (best-effort)
+- Save/Open native MagicaVoxel `.vox` projects (lossless voxel grid + palette)
 - Export to Wavefront `.obj` (+ `.mtl`) via a native save dialog — flat-shaded,
-  1 m blocks, origin at the model's bottom-center
+  1 m blocks, origin at the model's bottom-center, with hidden faces culled and
+  coplanar same-color faces merged (greedy meshing) to keep the triangle count low
 
 ## Requirements
 

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -12,15 +11,17 @@ pub struct Project {
     pub palette: Palette,
 }
 
-/// Open a model file, dispatching on its extension. `.vox` is the native,
-/// lossless format (voxel grid + palette); `.obj` is a best-effort import of a
-/// mesh we previously exported (one cube per voxel).
+/// Open a model file. Only the native, lossless `.vox` format (voxel grid +
+/// palette) can be opened; `.obj` is export-only.
 pub fn open(path: impl AsRef<Path>) -> Result<Project, Box<dyn Error>> {
     let path = path.as_ref();
     match path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
         Some("vox") => load_vox(path),
-        Some("obj") => load_obj(path),
-        other => Err(format!("unsupported file type: {}", other.unwrap_or("(none)")).into()),
+        other => Err(format!(
+            "unsupported file type: {} (only .vox can be opened)",
+            other.unwrap_or("(none)")
+        )
+        .into()),
     }
 }
 
@@ -133,136 +134,19 @@ pub fn load_vox(path: impl AsRef<Path>) -> Result<Project, Box<dyn Error>> {
     Ok(Project { chunk, palette })
 }
 
-/// Best-effort import of a Wavefront `.obj` we previously exported: one cube
-/// per voxel, eight vertices each, grouped by `usemtl matN`. Foreign meshes may
-/// not reconstruct cleanly — `.vox` is the format for round-tripping.
-///
-/// Colors come from the companion `.mtl` (`newmtl matN` + `Kd`), so the
-/// original palette indices are recovered when present.
-pub fn load_obj(path: impl AsRef<Path>) -> Result<Project, Box<dyn Error>> {
-    let path = path.as_ref();
-    let text = std::fs::read_to_string(path)?;
-
-    // material name -> palette index, from the companion .mtl. Falls back to
-    // sequential indices for any material we can't map.
-    let mtl_colors = read_mtl(&path.with_extension("mtl")).unwrap_or_default();
-    let mut palette = Palette::default();
-    for (&idx, &color) in &mtl_colors {
-        if let Some(slot) = palette.colors.get_mut(idx as usize) {
-            *slot = color;
-        }
-    }
-
-    // Walk the file in order, tracking the active material, collecting vertices.
-    // Every eight vertices form one exported cube.
-    let mut cur_color = 1u8;
-    let mut next_seq = 1u8; // for materials that aren't named "matN"
-    let mut seq_map: HashMap<String, u8> = HashMap::new();
-    let mut verts: Vec<[f32; 3]> = Vec::new();
-    let mut cubes: Vec<([f32; 3], u8)> = Vec::new(); // (min corner, color index)
-
-    for line in text.lines() {
-        let mut it = line.split_whitespace();
-        match it.next() {
-            Some("usemtl") => {
-                let name = it.next().unwrap_or("");
-                cur_color = name
-                    .strip_prefix("mat")
-                    .and_then(|n| n.parse::<u8>().ok())
-                    .unwrap_or_else(|| {
-                        *seq_map.entry(name.to_string()).or_insert_with(|| {
-                            let c = next_seq;
-                            next_seq = next_seq.saturating_add(1);
-                            c
-                        })
-                    });
-            }
-            Some("v") => {
-                let coords: Vec<f32> = it.filter_map(|t| t.parse().ok()).collect();
-                if coords.len() >= 3 {
-                    verts.push([coords[0], coords[1], coords[2]]);
-                    if verts.len() == 8 {
-                        let min = verts.iter().fold([f32::INFINITY; 3], |a, v| {
-                            [a[0].min(v[0]), a[1].min(v[1]), a[2].min(v[2])]
-                        });
-                        cubes.push((min, cur_color));
-                        verts.clear();
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    if cubes.is_empty() {
-        return Err("no voxels could be reconstructed from the .obj".into());
-    }
-
-    // Re-anchor to a non-negative integer grid: subtract the global minimum
-    // corner and round. (Export re-origins to the bottom-center, so corners can
-    // be fractional and negative.)
-    let gmin = cubes.iter().fold([f32::INFINITY; 3], |a, (m, _)| {
-        [a[0].min(m[0]), a[1].min(m[1]), a[2].min(m[2])]
-    });
-    let cells: Vec<([usize; 3], u8)> = cubes
-        .iter()
-        .map(|(m, c)| {
-            (
-                [
-                    (m[0] - gmin[0]).round().max(0.0) as usize,
-                    (m[1] - gmin[1]).round().max(0.0) as usize,
-                    (m[2] - gmin[2]).round().max(0.0) as usize,
-                ],
-                *c,
-            )
-        })
-        .collect();
-
-    let dims = cells.iter().fold([0usize; 3], |a, (p, _)| {
-        [a[0].max(p[0] + 1), a[1].max(p[1] + 1), a[2].max(p[2] + 1)]
-    });
-    let mut chunk = Chunk::with_size(dims[0], dims[1], dims[2]);
-    for (p, color_index) in cells {
-        chunk.set(p[0], p[1], p[2], Voxel { color_index });
-    }
-
-    Ok(Project { chunk, palette })
-}
-
-/// Parse `newmtl matN` / `Kd r g b` pairs into a map of palette index -> color.
-/// Only materials named `matN` are mapped (that's how [`export_obj`] names them).
-fn read_mtl(path: &Path) -> Option<HashMap<u8, [u8; 4]>> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let mut map = HashMap::new();
-    let mut cur: Option<u8> = None;
-    for line in text.lines() {
-        let mut it = line.split_whitespace();
-        match it.next() {
-            Some("newmtl") => {
-                cur = it.next().and_then(|n| n.strip_prefix("mat")).and_then(|n| n.parse().ok());
-            }
-            Some("Kd") => {
-                if let Some(idx) = cur {
-                    let c: Vec<f32> = it.filter_map(|t| t.parse().ok()).collect();
-                    if c.len() >= 3 {
-                        map.insert(idx, [
-                            (c[0] * 255.0).round() as u8,
-                            (c[1] * 255.0).round() as u8,
-                            (c[2] * 255.0).round() as u8,
-                            255,
-                        ]);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    Some(map)
-}
-
 /// Export the chunk to a Wavefront `.obj` file (plus a companion `.mtl` with one
-/// material per used color). Emits one cube per solid voxel — simple, correct,
-/// and colored; greedy merging isn't needed for an export of this size.
+/// material per used color).
+///
+/// The mesh is simplified before it is written. First, every face shared between
+/// two solid voxels is dropped — it is sealed inside the model and never visible.
+/// Then the remaining exposed faces are greedily merged: coplanar faces of the
+/// same color are combined into the largest rectangles possible (greedy
+/// meshing). The surface is unchanged, but a solid block exports as six quads
+/// instead of one cube per voxel.
+///
+/// Each emitted quad still carries an explicit flat normal and never shares
+/// vertices with another quad, so importers (e.g. Godot) keep the blocky flat
+/// shading instead of auto-smoothing across faces.
 pub fn export_obj(path: impl AsRef<Path>, chunk: &Chunk, palette: &Palette) -> Result<(), Box<dyn Error>> {
     let path = path.as_ref();
     let mtl_path = path.with_extension("mtl");
@@ -272,109 +156,202 @@ pub fn export_obj(path: impl AsRef<Path>, chunk: &Chunk, palette: &Palette) -> R
         .ok_or("invalid .mtl path")?
         .to_string();
 
-    // Local corner offsets of a unit cube and its six quad faces (1-based,
-    // relative to the cube's first vertex), wound counter-clockwise outward.
-    const CORNERS: [[i32; 3]; 8] = [
-        [0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0],
-        [0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1],
-    ];
-    const FACES: [[usize; 4]; 6] = [
-        [0, 1, 5, 4], // bottom (-Y)
-        [3, 7, 6, 2], // top (+Y)
-        [0, 3, 2, 1], // front (-Z)
-        [4, 5, 6, 7], // back (+Z)
-        [0, 4, 7, 3], // left (-X)
-        [1, 2, 6, 5], // right (+X)
-    ];
-    // One flat normal per face, in the same order as FACES. Emitting explicit
-    // normals (and never sharing vertices between faces) keeps importers like
-    // Godot from auto-generating *smooth* normals, which is what makes an
-    // un-normaled voxel export look gradient-shaded / "blurry".
-    const NORMALS: [[i32; 3]; 6] = [
-        [0, -1, 0], // bottom
-        [0, 1, 0],  // top
-        [0, 0, -1], // front
-        [0, 0, 1],  // back
-        [-1, 0, 0], // left
-        [1, 0, 0],  // right
-    ];
+    // Color of the voxel at integer coords, or None if empty / out of bounds. A
+    // face's outward neighbor can sit at -1 or past an edge; both read as empty.
+    let solid = |c: [i32; 3]| -> Option<u8> {
+        if c.iter().any(|&v| v < 0) {
+            return None;
+        }
+        chunk
+            .get(c[0] as usize, c[1] as usize, c[2] as usize)
+            .filter(|v| !v.is_empty())
+            .map(|v| v.color_index)
+    };
 
-    // Group by color so each material is referenced once and faces stay valid,
-    // and find the occupied bounding box so we can re-origin the model.
-    let mut used = std::collections::BTreeSet::new();
-    let mut by_color: std::collections::BTreeMap<u8, Vec<(usize, usize, usize)>> = std::collections::BTreeMap::new();
+    // Occupied bounding box, so the model can be re-origined to its bottom-center.
     let (mut min, mut max) = ([usize::MAX; 3], [usize::MIN; 3]);
+    let mut any = false;
     for x in 0..chunk.width {
         for y in 0..chunk.height {
             for z in 0..chunk.depth {
-                if let Some(v) = chunk.get(x, y, z) {
-                    if !v.is_empty() {
-                        by_color.entry(v.color_index).or_default().push((x, y, z));
-                        for (i, &c) in [x, y, z].iter().enumerate() {
-                            min[i] = min[i].min(c);
-                            max[i] = max[i].max(c);
-                        }
+                if chunk.get(x, y, z).is_some_and(|v| !v.is_empty()) {
+                    any = true;
+                    for (i, &c) in [x, y, z].iter().enumerate() {
+                        min[i] = min[i].min(c);
+                        max[i] = max[i].max(c);
                     }
                 }
             }
         }
     }
 
-    // Move the origin to the bottom-center of the model: X/Z centered on the
-    // occupied volume, Y resting on its lowest layer. Empty models export
-    // nothing meaningful, so fall back to no shift.
-    let (ox, oy, oz) = if by_color.is_empty() {
-        (0.0, 0.0, 0.0)
-    } else {
-        (
+    // Move the origin to the bottom-center: X/Z centered on the occupied volume,
+    // Y resting on its lowest layer. Empty models fall back to no shift.
+    let origin = if any {
+        [
             (min[0] + max[0] + 1) as f32 / 2.0,
             min[1] as f32,
             (min[2] + max[2] + 1) as f32 / 2.0,
-        )
+        ]
+    } else {
+        [0.0; 3]
     };
 
-    // World-units emitted per voxel. OBJ is unitless but importers (Godot)
-    // treat one unit as one metre, so a unit cube per voxel gives a 1 m block.
+    // World-units emitted per voxel. OBJ is unitless but importers (Godot) treat
+    // one unit as one metre, so a unit cube per voxel gives a 1 m block.
     const VOXEL_SIZE_M: f32 = 1.0;
+
+    // The six face directions, in the order their normals are written below.
+    // `axis` is the axis the face points along (0=x, 1=y, 2=z) and `sign` the
+    // direction; `u`/`v` are the two in-plane axes, ordered so the quad winds
+    // counter-clockwise when viewed from outside (its cross product is `normal`).
+    struct Dir {
+        normal: [i32; 3],
+        axis: usize,
+        sign: i32,
+        u: usize,
+        v: usize,
+    }
+    const DIRS: [Dir; 6] = [
+        Dir { normal: [-1, 0, 0], axis: 0, sign: -1, u: 2, v: 1 }, // -X (left)
+        Dir { normal: [1, 0, 0],  axis: 0, sign: 1,  u: 1, v: 2 }, // +X (right)
+        Dir { normal: [0, -1, 0], axis: 1, sign: -1, u: 0, v: 2 }, // -Y (bottom)
+        Dir { normal: [0, 1, 0],  axis: 1, sign: 1,  u: 2, v: 0 }, // +Y (top)
+        Dir { normal: [0, 0, -1], axis: 2, sign: -1, u: 1, v: 0 }, // -Z (front)
+        Dir { normal: [0, 0, 1],  axis: 2, sign: 1,  u: 0, v: 1 }, // +Z (back)
+    ];
+
+    let dims = [chunk.width, chunk.height, chunk.depth];
+
+    // One quad of the simplified mesh: its color, the 1-based normal index, and
+    // four corners in grid coordinates (CCW, outward-facing).
+    struct Quad {
+        color: u8,
+        normal_idx: usize,
+        corners: [[i32; 3]; 4],
+    }
+    let mut quads: Vec<Quad> = Vec::new();
+
+    for (ni, d) in DIRS.iter().enumerate() {
+        let (na, nu, nv) = (d.axis, d.u, d.v);
+        let (du, dv) = (dims[nu], dims[nv]);
+
+        // Sweep each grid layer perpendicular to this face's axis.
+        for layer in 0..dims[na] {
+            // Exposed-face mask for the layer: Some(color) where the voxel is
+            // solid and its outward neighbor (layer + sign) is not — i.e. the
+            // face is visible. Indexed [u + v * du].
+            let mut mask = vec![None; du * dv];
+            for j in 0..dv {
+                for i in 0..du {
+                    let mut cell = [0i32; 3];
+                    cell[na] = layer as i32;
+                    cell[nu] = i as i32;
+                    cell[nv] = j as i32;
+                    let Some(color) = solid(cell) else { continue };
+                    let mut neighbor = cell;
+                    neighbor[na] += d.sign;
+                    if solid(neighbor).is_none() {
+                        mask[i + j * du] = Some(color);
+                    }
+                }
+            }
+
+            // Greedily merge equal-color cells into maximal rectangles.
+            for j in 0..dv {
+                let mut i = 0;
+                while i < du {
+                    let Some(color) = mask[i + j * du] else {
+                        i += 1;
+                        continue;
+                    };
+                    // Widen along u while the color matches.
+                    let mut w = 1;
+                    while i + w < du && mask[i + w + j * du] == Some(color) {
+                        w += 1;
+                    }
+                    // Grow along v while every cell of the candidate row matches.
+                    let mut h = 1;
+                    'grow: while j + h < dv {
+                        for k in 0..w {
+                            if mask[i + k + (j + h) * du] != Some(color) {
+                                break 'grow;
+                            }
+                        }
+                        h += 1;
+                    }
+                    // Consume the rectangle so its cells aren't emitted again.
+                    for dj in 0..h {
+                        for di in 0..w {
+                            mask[i + di + (j + dj) * du] = None;
+                        }
+                    }
+
+                    // The face plane sits at `layer` for a negative normal and
+                    // `layer + 1` for a positive one.
+                    let p = layer as i32 + (d.sign > 0) as i32;
+                    let corner = |uu: usize, vv: usize| {
+                        let mut c = [0i32; 3];
+                        c[na] = p;
+                        c[nu] = uu as i32;
+                        c[nv] = vv as i32;
+                        c
+                    };
+                    quads.push(Quad {
+                        color,
+                        normal_idx: ni + 1,
+                        corners: [
+                            corner(i, j),
+                            corner(i + w, j),
+                            corner(i + w, j + h),
+                            corner(i, j + h),
+                        ],
+                    });
+
+                    i += w;
+                }
+            }
+        }
+    }
+
+    // Group quads by color so each material is named once and faces stay valid.
+    let mut by_color: std::collections::BTreeMap<u8, Vec<&Quad>> = std::collections::BTreeMap::new();
+    for q in &quads {
+        by_color.entry(q.color).or_default().push(q);
+    }
 
     let mut obj = String::new();
     writeln!(obj, "# Exported by Voxely")?;
     writeln!(obj, "mtllib {mtl_name}")?;
-    for n in NORMALS {
-        writeln!(obj, "vn {} {} {}", n[0], n[1], n[2])?;
+    for d in &DIRS {
+        writeln!(obj, "vn {} {} {}", d.normal[0], d.normal[1], d.normal[2])?;
     }
 
     let mut vbase = 0u32;
-    for (&color, cells) in &by_color {
-        used.insert(color);
+    for (&color, group) in &by_color {
         writeln!(obj, "usemtl mat{color}")?;
-        for &(x, y, z) in cells {
-            for c in CORNERS {
+        for q in group {
+            for c in q.corners {
                 writeln!(
                     obj,
                     "v {} {} {}",
-                    ((x as i32 + c[0]) as f32 - ox) * VOXEL_SIZE_M,
-                    ((y as i32 + c[1]) as f32 - oy) * VOXEL_SIZE_M,
-                    ((z as i32 + c[2]) as f32 - oz) * VOXEL_SIZE_M
+                    (c[0] as f32 - origin[0]) * VOXEL_SIZE_M,
+                    (c[1] as f32 - origin[1]) * VOXEL_SIZE_M,
+                    (c[2] as f32 - origin[2]) * VOXEL_SIZE_M
                 )?;
             }
-            for (fi, f) in FACES.iter().enumerate() {
-                let n = fi + 1; // vn indices are global and 1-based
-                writeln!(
-                    obj,
-                    "f {0}//{n} {1}//{n} {2}//{n} {3}//{n}",
-                    vbase + f[0] as u32 + 1,
-                    vbase + f[1] as u32 + 1,
-                    vbase + f[2] as u32 + 1,
-                    vbase + f[3] as u32 + 1
-                )?;
-            }
-            vbase += 8;
+            let n = q.normal_idx; // vn indices are global and 1-based
+            writeln!(
+                obj,
+                "f {0}//{n} {1}//{n} {2}//{n} {3}//{n}",
+                vbase + 1, vbase + 2, vbase + 3, vbase + 4
+            )?;
+            vbase += 4;
         }
     }
 
     let mut mtl = String::from("# Exported by Voxely\n");
-    for color in used {
+    for &color in by_color.keys() {
         let c = palette.colors.get(color as usize).copied().unwrap_or([255, 255, 255, 255]);
         writeln!(mtl, "newmtl mat{color}")?;
         writeln!(
@@ -396,7 +373,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn export_obj_emits_a_cube_per_voxel() {
+    fn export_culls_hidden_faces_of_a_lone_voxel() {
         let mut chunk = Chunk::new();
         chunk.set(2, 3, 4, Voxel { color_index: 1 });
         let palette = Palette::default();
@@ -406,8 +383,10 @@ mod tests {
         export_obj(&obj_path, &chunk, &palette).expect("export should succeed");
 
         let obj = std::fs::read_to_string(&obj_path).unwrap();
-        assert_eq!(obj.lines().filter(|l| l.starts_with("v ")).count(), 8, "one cube = 8 vertices");
-        assert_eq!(obj.lines().filter(|l| l.starts_with("f ")).count(), 6, "one cube = 6 faces");
+        // An isolated voxel exposes all six faces; merging can't combine them, so
+        // we get six quads, each with its own four (unshared) vertices.
+        assert_eq!(obj.lines().filter(|l| l.starts_with("f ")).count(), 6, "six exposed faces");
+        assert_eq!(obj.lines().filter(|l| l.starts_with("v ")).count(), 24, "6 quads x 4 verts");
         assert!(obj.contains("usemtl mat1"));
 
         let mtl = std::fs::read_to_string(dir.join("voxely_test_export.mtl")).unwrap();
@@ -418,10 +397,38 @@ mod tests {
     }
 
     #[test]
+    fn export_greedy_merges_and_culls() {
+        // A solid 2x2x2 block: every interior face is sealed and culled, and each
+        // of the six outward sides is a flat 2x2 surface of one color, so greedy
+        // meshing collapses the whole thing to six quads (24 verts) instead of
+        // eight cubes (48 faces / 192 verts).
+        let mut chunk = Chunk::with_size(4, 4, 4);
+        for x in 0..2 {
+            for y in 0..2 {
+                for z in 0..2 {
+                    chunk.set(x, y, z, Voxel { color_index: 1 });
+                }
+            }
+        }
+
+        let dir = std::env::temp_dir();
+        let obj_path = dir.join("voxely_test_greedy.obj");
+        export_obj(&obj_path, &chunk, &Palette::default()).expect("export should succeed");
+        let obj = std::fs::read_to_string(&obj_path).unwrap();
+
+        assert_eq!(obj.lines().filter(|l| l.starts_with("f ")).count(), 6, "2x2x2 block = 6 merged quads");
+        assert_eq!(obj.lines().filter(|l| l.starts_with("v ")).count(), 24, "6 quads x 4 verts");
+
+        let _ = std::fs::remove_file(&obj_path);
+        let _ = std::fs::remove_file(obj_path.with_extension("mtl"));
+    }
+
+    #[test]
     fn export_reorigins_to_bottom_center_with_flat_normals() {
         // Two voxels stacked at x=4,z=6 over y=2..=3. Occupied box is a single
         // column, so X/Z center on the cell centers (4.5, 6.5) and Y rests on
-        // the lowest layer (2).
+        // the lowest layer (2). The shared face between them is culled and each
+        // side merges into one 1x2 quad.
         let mut chunk = Chunk::new();
         chunk.set(4, 2, 6, Voxel { color_index: 1 });
         chunk.set(4, 3, 6, Voxel { color_index: 1 });
@@ -475,29 +482,5 @@ mod tests {
         assert_eq!(loaded.palette.colors[7], palette.colors[7]);
         assert_eq!(loaded.palette.colors[3], palette.colors[3]);
         let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn export_then_load_obj_round_trips_shape_and_color() {
-        let mut chunk = Chunk::with_size(10, 10, 10);
-        chunk.set(2, 0, 1, Voxel { color_index: 4 });
-        chunk.set(3, 0, 1, Voxel { color_index: 4 });
-        chunk.set(2, 1, 1, Voxel { color_index: 7 });
-        let palette = Palette::default();
-
-        let path = std::env::temp_dir().join("voxely_test_obj_roundtrip.obj");
-        export_obj(&path, &chunk, &palette).expect("export should succeed");
-        let loaded = load_obj(&path).expect("load should succeed");
-
-        // Shape is re-anchored to the origin: the lowest/leftmost voxel moves to
-        // (0,0,0), so relative layout is what we check.
-        let count = (0..loaded.chunk.width)
-            .flat_map(|x| (0..loaded.chunk.height).flat_map(move |y| (0..loaded.chunk.depth).map(move |z| (x, y, z))))
-            .filter(|&(x, y, z)| loaded.chunk.get(x, y, z).map(|v| !v.is_empty()).unwrap_or(false))
-            .count();
-        assert_eq!(count, 3, "all three voxels survive the obj round-trip");
-
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(path.with_extension("mtl"));
     }
 }
