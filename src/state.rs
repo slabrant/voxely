@@ -52,6 +52,16 @@ pub struct State {
     last_grid_coord: Option<[i32; 3]>,
     drag_start_voxels: Vec<[i32; 3]>,
     rect_drag: Option<RectDrag>,
+    tool: Tool,
+}
+
+/// The active editing tool, chosen from the UI or with a hotkey.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tool {
+    /// Place/erase individual voxels (click, drag, or ctrl-drag rectangle).
+    Brush,
+    /// Flood-fill a connected region of one color (click to apply).
+    Bucket,
 }
 
 /// State for an in-progress ctrl+left-drag rectangle fill.
@@ -531,6 +541,7 @@ impl State {
             last_grid_coord: None,
             drag_start_voxels: Vec::new(),
             rect_drag: None,
+            tool: Tool::Brush,
         }
     }
 
@@ -561,7 +572,7 @@ impl State {
                 if self.is_left_mouse_pressed {
                     if self.rect_drag.is_some() {
                         self.update_rect();
-                    } else {
+                    } else if self.tool == Tool::Brush {
                         self.handle_drag();
                     }
                 }
@@ -573,7 +584,12 @@ impl State {
                     self.is_left_mouse_pressed = *state == winit::event::ElementState::Pressed;
                     if self.is_left_mouse_pressed {
                         self.drag_start_voxels.clear();
-                        if self.modifiers.control_key() {
+                        // Every gesture (click, drag, rectangle, bucket) is one
+                        // undo step; bracket it here and close it on release.
+                        self.history.begin_group();
+                        if self.tool == Tool::Bucket {
+                            self.handle_bucket();
+                        } else if self.modifiers.control_key() {
                             // ctrl(+shift) initiates a plane-locked rectangle fill.
                             self.begin_rect();
                         } else {
@@ -584,6 +600,7 @@ impl State {
                         if self.rect_drag.is_some() {
                             self.commit_rect();
                         }
+                        self.history.end_group();
                         self.last_grid_coord = None;
                         self.drag_start_voxels.clear();
                     }
@@ -619,6 +636,10 @@ impl State {
                         KeyCode::Digit7 if !*repeat => { self.current_color_index = 7; return true; }
                         KeyCode::Digit8 if !*repeat => { self.current_color_index = 8; return true; }
                         KeyCode::Digit9 if !*repeat => { self.current_color_index = 9; return true; }
+                        KeyCode::KeyB if !ctrl && !*repeat => {
+                            self.tool = if self.tool == Tool::Bucket { Tool::Brush } else { Tool::Bucket };
+                            return true;
+                        }
                         KeyCode::KeyS if ctrl && !*repeat => { self.save_project(); return true; }
                         KeyCode::KeyL if ctrl && !*repeat => { self.load_project(); return true; }
                         KeyCode::KeyI if ctrl && !*repeat => { self.import_vox(); return true; }
@@ -859,6 +880,62 @@ impl State {
         }
     }
 
+    /// Paint-bucket flood fill: recolors the connected region (6-adjacency) of
+    /// voxels sharing the clicked voxel's color. Holding shift erases the region
+    /// instead. The whole flood is recorded as a single undo group by the
+    /// caller. Does nothing if the cursor isn't over a solid voxel.
+    fn handle_bucket(&mut self) {
+        use crate::core::chunk::{CHUNK_WIDTH, CHUNK_HEIGHT, CHUNK_DEPTH};
+        let ray_dir = self.screen_to_ray(self.cursor_position);
+        let ray_origin = self.camera.eye;
+
+        let Some((pos, _normal, _)) = self.raycast(ray_origin, ray_dir) else { return };
+        if pos[0] < 0 || pos[1] < 0 || pos[2] < 0 {
+            return; // boundary-only hit, no voxel to fill
+        }
+        let (sx, sy, sz) = (pos[0] as usize, pos[1] as usize, pos[2] as usize);
+        let target = match self.chunk.get(sx, sy, sz) {
+            Some(v) if !v.is_empty() => v.color_index,
+            _ => return,
+        };
+        let new_color = if self.modifiers.shift_key() { 0 } else { self.current_color_index };
+        if new_color == target {
+            return;
+        }
+
+        // Iterative flood fill. Mutate the chunk directly and record each change
+        // so we can remesh just once at the end.
+        let mut stack = vec![[sx, sy, sz]];
+        let mut changed = false;
+        while let Some([x, y, z]) = stack.pop() {
+            let Some(v) = self.chunk.get(x, y, z) else { continue };
+            if v.is_empty() || v.color_index != target {
+                continue;
+            }
+            let old = *v;
+            self.chunk.set(x, y, z, Voxel { color_index: new_color });
+            self.history.record(VoxelEdit {
+                x,
+                y,
+                z,
+                old,
+                new: Voxel { color_index: new_color },
+            });
+            changed = true;
+
+            if x + 1 < CHUNK_WIDTH { stack.push([x + 1, y, z]); }
+            if x > 0 { stack.push([x - 1, y, z]); }
+            if y + 1 < CHUNK_HEIGHT { stack.push([x, y + 1, z]); }
+            if y > 0 { stack.push([x, y - 1, z]); }
+            if z + 1 < CHUNK_DEPTH { stack.push([x, y, z + 1]); }
+            if z > 0 { stack.push([x, y, z - 1]); }
+        }
+
+        if changed {
+            self.remesh();
+        }
+    }
+
     /// Rebuilds the overlay vertex buffer for the current frame: the rectangle
     /// preview while dragging, otherwise the hover-face highlight under the
     /// cursor. Empty when the cursor isn't over the world.
@@ -957,16 +1034,22 @@ impl State {
     }
 
     fn undo(&mut self) {
-        if let Some(e) = self.history.undo() {
-            self.chunk.set(e.x, e.y, e.z, e.old);
+        if let Some(group) = self.history.undo() {
+            // Reverse order so coordinates touched more than once in a single
+            // gesture land back on their original value.
+            for e in group.iter().rev() {
+                self.chunk.set(e.x, e.y, e.z, e.old);
+            }
             self.remesh();
             println!("Undo");
         }
     }
 
     fn redo(&mut self) {
-        if let Some(e) = self.history.redo() {
-            self.chunk.set(e.x, e.y, e.z, e.new);
+        if let Some(group) = self.history.redo() {
+            for e in &group {
+                self.chunk.set(e.x, e.y, e.z, e.new);
+            }
             self.remesh();
             println!("Redo");
         }
@@ -1307,6 +1390,23 @@ impl State {
                 ui.heading("Voxely");
                 ui.separator();
 
+                ui.label("Tool");
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(self.tool == Tool::Brush, "🖌 Brush")
+                        .clicked()
+                    {
+                        self.tool = Tool::Brush;
+                    }
+                    if ui
+                        .selectable_label(self.tool == Tool::Bucket, "🪣 Bucket")
+                        .clicked()
+                    {
+                        self.tool = Tool::Bucket;
+                    }
+                });
+
+                ui.add_space(6.0);
                 ui.label("History");
                 ui.horizontal(|ui| {
                     if ui.button("⟲ Undo").clicked() {
@@ -1392,6 +1492,8 @@ impl State {
                 ui.label("Middle-drag: pan · Scroll: zoom");
                 ui.label("Ctrl + Left-drag: fill rectangle");
                 ui.label("Ctrl + Shift + Left-drag: erase rectangle");
+                ui.label("B: toggle brush/bucket");
+                ui.label("Bucket click: fill region · Shift: erase region");
             });
     }
 }

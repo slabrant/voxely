@@ -91,27 +91,61 @@ pub fn export_obj(path: impl AsRef<Path>, chunk: &Chunk, palette: &Palette) -> R
         [0, 4, 7, 3], // left (-X)
         [1, 2, 6, 5], // right (+X)
     ];
+    // One flat normal per face, in the same order as FACES. Emitting explicit
+    // normals (and never sharing vertices between faces) keeps importers like
+    // Godot from auto-generating *smooth* normals, which is what makes an
+    // un-normaled voxel export look gradient-shaded / "blurry".
+    const NORMALS: [[i32; 3]; 6] = [
+        [0, -1, 0], // bottom
+        [0, 1, 0],  // top
+        [0, 0, -1], // front
+        [0, 0, 1],  // back
+        [-1, 0, 0], // left
+        [1, 0, 0],  // right
+    ];
 
+    // Group by color so each material is referenced once and faces stay valid,
+    // and find the occupied bounding box so we can re-origin the model.
     let mut used = std::collections::BTreeSet::new();
-    let mut obj = String::new();
-    writeln!(obj, "# Exported by Voxely")?;
-    writeln!(obj, "mtllib {mtl_name}")?;
-
-    let mut vbase = 0u32;
-    // Group by color so each material is referenced once and faces stay valid.
     let mut by_color: std::collections::BTreeMap<u8, Vec<(usize, usize, usize)>> = std::collections::BTreeMap::new();
+    let (mut min, mut max) = ([usize::MAX; 3], [usize::MIN; 3]);
     for x in 0..CHUNK_WIDTH {
         for y in 0..CHUNK_HEIGHT {
             for z in 0..CHUNK_DEPTH {
                 if let Some(v) = chunk.get(x, y, z) {
                     if !v.is_empty() {
                         by_color.entry(v.color_index).or_default().push((x, y, z));
+                        for (i, &c) in [x, y, z].iter().enumerate() {
+                            min[i] = min[i].min(c);
+                            max[i] = max[i].max(c);
+                        }
                     }
                 }
             }
         }
     }
 
+    // Move the origin to the bottom-center of the model: X/Z centered on the
+    // occupied volume, Y resting on its lowest layer. Empty models export
+    // nothing meaningful, so fall back to no shift.
+    let (ox, oy, oz) = if by_color.is_empty() {
+        (0.0, 0.0, 0.0)
+    } else {
+        (
+            (min[0] + max[0] + 1) as f32 / 2.0,
+            min[1] as f32,
+            (min[2] + max[2] + 1) as f32 / 2.0,
+        )
+    };
+
+    let mut obj = String::new();
+    writeln!(obj, "# Exported by Voxely")?;
+    writeln!(obj, "mtllib {mtl_name}")?;
+    for n in NORMALS {
+        writeln!(obj, "vn {} {} {}", n[0], n[1], n[2])?;
+    }
+
+    let mut vbase = 0u32;
     for (&color, cells) in &by_color {
         used.insert(color);
         writeln!(obj, "usemtl mat{color}")?;
@@ -120,15 +154,16 @@ pub fn export_obj(path: impl AsRef<Path>, chunk: &Chunk, palette: &Palette) -> R
                 writeln!(
                     obj,
                     "v {} {} {}",
-                    x as i32 + c[0],
-                    y as i32 + c[1],
-                    z as i32 + c[2]
+                    (x as i32 + c[0]) as f32 - ox,
+                    (y as i32 + c[1]) as f32 - oy,
+                    (z as i32 + c[2]) as f32 - oz
                 )?;
             }
-            for f in FACES {
+            for (fi, f) in FACES.iter().enumerate() {
+                let n = fi + 1; // vn indices are global and 1-based
                 writeln!(
                     obj,
-                    "f {} {} {} {}",
+                    "f {0}//{n} {1}//{n} {2}//{n} {3}//{n}",
                     vbase + f[0] as u32 + 1,
                     vbase + f[1] as u32 + 1,
                     vbase + f[2] as u32 + 1,
@@ -188,6 +223,47 @@ mod tests {
 
         let _ = std::fs::remove_file(&obj_path);
         let _ = std::fs::remove_file(dir.join("voxely_test_export.mtl"));
+    }
+
+    #[test]
+    fn export_reorigins_to_bottom_center_with_flat_normals() {
+        // Two voxels stacked at x=4,z=6 over y=2..=3. Occupied box is a single
+        // column, so X/Z center on the cell centers (4.5, 6.5) and Y rests on
+        // the lowest layer (2).
+        let mut chunk = Chunk::new();
+        chunk.set(4, 2, 6, Voxel { color_index: 1 });
+        chunk.set(4, 3, 6, Voxel { color_index: 1 });
+
+        let dir = std::env::temp_dir();
+        let obj_path = dir.join("voxely_test_origin.obj");
+        export_obj(&obj_path, &chunk, &Palette::default()).expect("export should succeed");
+        let obj = std::fs::read_to_string(&obj_path).unwrap();
+
+        // Six face normals are declared up front.
+        assert_eq!(obj.lines().filter(|l| l.starts_with("vn ")).count(), 6);
+        // Faces reference a normal, which forces flat shading on import.
+        assert!(obj.lines().any(|l| l.starts_with("f ") && l.contains("//")));
+
+        let verts: Vec<[f32; 3]> = obj
+            .lines()
+            .filter(|l| l.starts_with("v "))
+            .map(|l| {
+                let mut it = l.split_whitespace().skip(1).map(|n| n.parse::<f32>().unwrap());
+                [it.next().unwrap(), it.next().unwrap(), it.next().unwrap()]
+            })
+            .collect();
+        let min_x = verts.iter().map(|v| v[0]).fold(f32::INFINITY, f32::min);
+        let max_x = verts.iter().map(|v| v[0]).fold(f32::NEG_INFINITY, f32::max);
+        let min_y = verts.iter().map(|v| v[1]).fold(f32::INFINITY, f32::min);
+        let min_z = verts.iter().map(|v| v[2]).fold(f32::INFINITY, f32::min);
+        let max_z = verts.iter().map(|v| v[2]).fold(f32::NEG_INFINITY, f32::max);
+
+        assert!((min_x + max_x).abs() < 1e-5, "X should straddle the origin");
+        assert!((min_z + max_z).abs() < 1e-5, "Z should straddle the origin");
+        assert!(min_y.abs() < 1e-5, "the model should rest on y=0");
+
+        let _ = std::fs::remove_file(&obj_path);
+        let _ = std::fs::remove_file(dir.join("voxely_test_origin.mtl"));
     }
 
     #[test]

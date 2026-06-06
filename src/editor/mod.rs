@@ -10,54 +10,91 @@ pub struct VoxelEdit {
     pub new: Voxel,
 }
 
-/// Undo/redo stack for voxel edits.
+/// Undo/redo stacks of voxel edits, grouped per user gesture.
 ///
-/// Recording a new edit clears the redo stack, matching the usual editor
+/// Each entry on a stack is a *group*: all the voxels touched by one action
+/// (a single click, a drag stroke, a rectangle fill, a paint-bucket flood)
+/// undo and redo as a unit. A gesture is bracketed by [`begin_group`] /
+/// [`end_group`]; edits recorded in between accumulate into the open group.
+///
+/// Recording a new group clears the redo stack, matching the usual editor
 /// behavior where doing something new discards the "future" you undid past.
+///
+/// [`begin_group`]: EditHistory::begin_group
+/// [`end_group`]: EditHistory::end_group
 #[derive(Default)]
 pub struct EditHistory {
-    undo: Vec<VoxelEdit>,
-    redo: Vec<VoxelEdit>,
+    undo: Vec<Vec<VoxelEdit>>,
+    redo: Vec<Vec<VoxelEdit>>,
+    current: Option<Vec<VoxelEdit>>,
 }
 
 impl EditHistory {
-    pub fn record(&mut self, edit: VoxelEdit) {
-        self.undo.push(edit);
-        self.redo.clear();
+    /// Opens a new group. Edits recorded until [`end_group`](Self::end_group)
+    /// accumulate into it and undo/redo together.
+    pub fn begin_group(&mut self) {
+        self.current = Some(Vec::new());
     }
 
-    /// Records an edit that is part of a continuous stroke. 
-    /// If the last edit was at the same coordinates, it updates it instead of pushing a new one.
-    /// This prevents a single drag stroke from filling the undo buffer with many small changes
-    /// to the same voxel.
+    /// Closes the open group, committing it to the undo stack if it touched
+    /// anything. An empty group (a gesture that changed nothing) is dropped.
+    pub fn end_group(&mut self) {
+        if let Some(group) = self.current.take() {
+            if !group.is_empty() {
+                self.undo.push(group);
+                self.redo.clear();
+            }
+        }
+    }
+
+    /// Records an edit into the open group. If no group is open, the edit is
+    /// committed as a group of its own.
+    pub fn record(&mut self, edit: VoxelEdit) {
+        match &mut self.current {
+            Some(group) => group.push(edit),
+            None => {
+                self.undo.push(vec![edit]);
+                self.redo.clear();
+            }
+        }
+    }
+
+    /// Records an edit that is part of a continuous stroke. If the most recent
+    /// edit in the open group is at the same coordinates, it updates that edit
+    /// in place instead of appending a new one, so a drag that lingers on one
+    /// voxel doesn't bloat the group.
     pub fn record_continuous(&mut self, edit: VoxelEdit) {
-        if let Some(last) = self.undo.last_mut() {
-            if last.x == edit.x && last.y == edit.y && last.z == edit.z {
-                last.new = edit.new;
-                return;
+        if let Some(group) = &mut self.current {
+            if let Some(last) = group.last_mut() {
+                if last.x == edit.x && last.y == edit.y && last.z == edit.z {
+                    last.new = edit.new;
+                    return;
+                }
             }
         }
         self.record(edit);
     }
 
-    /// Pops the most recent edit. The caller should re-apply `old` at the
-    /// edit's position to revert it.
-    pub fn undo(&mut self) -> Option<VoxelEdit> {
-        let edit = self.undo.pop()?;
-        self.redo.push(edit);
-        Some(edit)
+    /// Pops the most recent group. The caller should re-apply each edit's `old`
+    /// value (in reverse order) to revert it.
+    pub fn undo(&mut self) -> Option<Vec<VoxelEdit>> {
+        let group = self.undo.pop()?;
+        self.redo.push(group.clone());
+        Some(group)
     }
 
-    /// Pops the most recently undone edit. The caller should re-apply `new`.
-    pub fn redo(&mut self) -> Option<VoxelEdit> {
-        let edit = self.redo.pop()?;
-        self.undo.push(edit);
-        Some(edit)
+    /// Pops the most recently undone group. The caller should re-apply each
+    /// edit's `new` value (in forward order).
+    pub fn redo(&mut self) -> Option<Vec<VoxelEdit>> {
+        let group = self.redo.pop()?;
+        self.undo.push(group.clone());
+        Some(group)
     }
 
     pub fn clear(&mut self) {
         self.undo.clear();
         self.redo.clear();
+        self.current = None;
     }
 }
 
@@ -79,11 +116,11 @@ mod tests {
     fn undo_then_redo_round_trips() {
         let mut h = EditHistory::default();
         h.record(edit(0, 5));
-        let u = h.undo().expect("an edit to undo");
-        assert_eq!(u.old.color_index, 0, "undo should restore the old value");
-        let r = h.redo().expect("an edit to redo");
-        assert_eq!(r.new.color_index, 5, "redo should reapply the new value");
-        assert!(h.undo().is_some(), "edit is back on the undo stack after redo");
+        let u = h.undo().expect("a group to undo");
+        assert_eq!(u[0].old.color_index, 0, "undo should restore the old value");
+        let r = h.redo().expect("a group to redo");
+        assert_eq!(r[0].new.color_index, 5, "redo should reapply the new value");
+        assert!(h.undo().is_some(), "group is back on the undo stack after redo");
     }
 
     #[test]
@@ -93,5 +130,26 @@ mod tests {
         h.undo();
         h.record(edit(0, 2));
         assert!(h.redo().is_none(), "a new edit must discard the redo stack");
+    }
+
+    #[test]
+    fn a_group_undoes_as_a_unit() {
+        let mut h = EditHistory::default();
+        h.begin_group();
+        h.record(edit(0, 1));
+        h.record(edit(0, 2));
+        h.record(edit(0, 3));
+        h.end_group();
+        let g = h.undo().expect("one group covering all three edits");
+        assert_eq!(g.len(), 3, "the whole gesture undoes at once");
+        assert!(h.undo().is_none(), "there was only a single group");
+    }
+
+    #[test]
+    fn empty_group_is_dropped() {
+        let mut h = EditHistory::default();
+        h.begin_group();
+        h.end_group();
+        assert!(h.undo().is_none(), "a gesture that changed nothing leaves no history");
     }
 }
