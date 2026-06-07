@@ -20,11 +20,12 @@ pub const ACTION_REPEAT_DELAY: std::time::Duration = std::time::Duration::from_m
 
     println!("--- Voxely Quick Start ---");
     println!("Orbit: Right-Click + Drag  |  Pan: Middle-Click + Drag  |  Zoom: Scroll");
-    println!("Place Voxel: Left-Click    |  Remove Voxel: Shift + Left-Click");
+    println!("Build/Paint: Left-Click    |  Erase: Shift + Right-Click");
+    println!("Eyedropper: Shift + Left-Click  |  Cycle Tool: B");
     println!("Change Color: 1-9");
     println!("Undo: Ctrl+Z  |  Redo: Ctrl+Y");
-    println!("Save: Ctrl+S  |  Load: Ctrl+L");
-    println!("Import .vox: Ctrl+I  |  Export .obj: Ctrl+E");
+    println!("Save: Ctrl+S  |  Save As: Ctrl+Shift+S  |  Open: Ctrl+O");
+    println!("Export .obj: Ctrl+E");
     println!("--------------------------");
 
     let event_loop = EventLoop::new().unwrap();

@@ -5,7 +5,8 @@ an [egui](https://www.egui.rs/) side panel.
 
 ## Features
 
-- Place, erase, line-drag, rectangle-fill, and flood-fill (paint bucket) voxels
+- Build, paint (recolor), erase, line-drag, rectangle-fill, and flood-fill voxels
+- Eyedropper (Shift + left-click) to sample a voxel's color
 - Cursor face highlight showing where the next voxel lands
 - 64-color palette with live recoloring, and full undo/redo (one step per action)
 - Resizable canvas (W×H×D) from the UI
@@ -49,11 +50,13 @@ cargo build --release --target x86_64-pc-windows-gnu
 
 | Action | Input |
 | --- | --- |
-| Place voxel | Left-click / left-drag |
-| Remove voxel | Shift + left-click / drag |
-| Fill rectangle | Ctrl + left-drag |
-| Erase rectangle | Ctrl + Shift + left-drag |
-| Paint bucket (fill region) | `B` to toggle, then click — Shift to erase |
+| Build / paint voxel (active tool) | Left-click / left-drag |
+| Erase voxel | Shift + right-click / drag |
+| Eyedropper (sample color) | Shift + left-click |
+| Cycle tool (Build → Paint → Bucket) | `B` |
+| Fill rectangle | Ctrl + left-drag (Build) |
+| Erase rectangle | Ctrl + Shift + right-drag |
+| Paint bucket | Bucket tool, click to fill — Shift + right-click to erase region |
 | Pick color | `1`–`9`, or click a palette swatch |
 | Orbit / pan / zoom | Right-drag / middle-drag / scroll |
 | Undo / redo | Ctrl+Z / Ctrl+Y |

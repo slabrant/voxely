@@ -47,7 +47,17 @@ pub struct State {
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
     is_left_mouse_pressed: bool,
+    /// True while a Shift+Right erase gesture is in progress (click or drag).
+    /// The camera is suppressed for the duration so the view doesn't orbit.
+    is_right_erasing: bool,
+    /// True while a Shift+Left eyedropper gesture is in progress, so cursor
+    /// motion isn't mistaken for a paint/build drag.
+    is_eyedropping: bool,
     last_action_time: std::time::Duration,
+    /// Most recent elapsed-time stamp handed to [`update`](Self::update). The
+    /// key handlers read it to schedule the *first* undo/redo auto-repeat one
+    /// `ACTION_REPEAT_DELAY` after the press (they have no clock of their own).
+    last_update_time: std::time::Duration,
     is_undo_pressed: bool,
     is_redo_pressed: bool,
     last_grid_coord: Option<[i32; 3]>,
@@ -64,8 +74,12 @@ pub struct State {
 /// The active editing tool, chosen from the UI or with a hotkey.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tool {
-    /// Place/erase individual voxels (click, drag, or ctrl-drag rectangle).
-    Brush,
+    /// Add voxels: left-click/drag places (and ctrl-drag fills a rectangle).
+    /// Geometry only — erasing lives on Shift+Right-click for every tool.
+    Build,
+    /// Recolor existing voxels to the active color. Never adds or removes
+    /// geometry: clicks/drags over empty space do nothing.
+    Paint,
     /// Flood-fill a connected region of one color (click to apply).
     Bucket,
 }
@@ -510,13 +524,16 @@ impl State {
             egui_state,
             egui_renderer,
             is_left_mouse_pressed: false,
+            is_right_erasing: false,
+            is_eyedropping: false,
             last_action_time: std::time::Duration::ZERO,
+            last_update_time: std::time::Duration::ZERO,
             is_undo_pressed: false,
             is_redo_pressed: false,
             last_grid_coord: None,
             drag_start_voxels: Vec::new(),
             rect_drag: None,
-            tool: Tool::Brush,
+            tool: Tool::Build,
             pending_size: [chunk_w, chunk_h, chunk_d],
             current_path: None,
         }
@@ -546,44 +563,102 @@ impl State {
                 let dy = (position.y - self.cursor_position.y) as f32;
                 self.camera_controller.handle_mouse_motion(dx, dy);
                 self.cursor_position = *position;
-                if self.is_left_mouse_pressed {
+                if self.is_left_mouse_pressed && !self.is_eyedropping {
                     if self.rect_drag.is_some() {
                         self.update_rect();
-                    } else if self.tool == Tool::Brush {
-                        self.handle_drag();
+                    } else if self.tool != Tool::Bucket {
+                        // Build and Paint both stroke along the drag; Bucket is
+                        // click-only.
+                        self.handle_drag(false);
+                    }
+                }
+                // Shift+Right-drag erases: a rectangle if one is in progress,
+                // otherwise a continuous stroke (Bucket already flooded on press).
+                if self.is_right_erasing {
+                    if self.rect_drag.is_some() {
+                        self.update_rect();
+                    } else if self.tool != Tool::Bucket {
+                        self.handle_drag(true);
                     }
                 }
                 self.update_overlay();
                 false
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                if *button == winit::event::MouseButton::Left {
-                    self.is_left_mouse_pressed = *state == winit::event::ElementState::Pressed;
-                    if self.is_left_mouse_pressed {
-                        self.drag_start_voxels.clear();
-                        // Every gesture (click, drag, rectangle, bucket) is one
-                        // undo step; bracket it here and close it on release.
-                        self.history.begin_group();
-                        if self.tool == Tool::Bucket {
-                            self.handle_bucket();
-                        } else if self.modifiers.control_key() {
-                            // ctrl(+shift) initiates a plane-locked rectangle fill.
-                            self.begin_rect();
+                let pressed = *state == winit::event::ElementState::Pressed;
+                match button {
+                    winit::event::MouseButton::Left => {
+                        self.is_left_mouse_pressed = pressed;
+                        if pressed {
+                            if self.modifiers.shift_key() && !self.modifiers.control_key() {
+                                // Shift+Left-click is the eyedropper: adopt the
+                                // color under the cursor. No edit -> no history.
+                                self.pick_color();
+                                self.is_eyedropping = true;
+                            } else {
+                                self.drag_start_voxels.clear();
+                                // Every gesture (click, drag, rectangle, bucket)
+                                // is one undo step; bracket it here, close on release.
+                                self.history.begin_group();
+                                if self.tool == Tool::Bucket {
+                                    self.handle_bucket();
+                                } else if self.tool == Tool::Build && self.modifiers.control_key() {
+                                    // Ctrl+Left-drag fills a plane-locked rectangle.
+                                    // (Erasing a rectangle lives on Ctrl+Shift+Right.)
+                                    self.begin_rect(false);
+                                } else {
+                                    self.handle_click(false);
+                                }
+                            }
+                        } else if self.is_eyedropping {
+                            self.is_eyedropping = false;
+                            self.last_grid_coord = None;
                         } else {
-                            self.handle_click();
+                            // Releasing the button commits any in-progress rectangle.
+                            if self.rect_drag.is_some() {
+                                self.commit_rect();
+                            }
+                            self.history.end_group();
+                            self.last_grid_coord = None;
+                            self.drag_start_voxels.clear();
                         }
-                    } else {
-                        // Releasing the button commits any in-progress rectangle.
+                        self.update_overlay();
+                        self.camera_controller.process_events(event)
+                    }
+                    // Shift+Right starts an erase gesture: a rectangle erase when
+                    // Ctrl is also held (Build), a region flood in Bucket mode,
+                    // otherwise the voxel/stroke under the cursor. Consumed so the
+                    // camera doesn't also orbit.
+                    winit::event::MouseButton::Right if pressed && self.modifiers.shift_key() => {
+                        self.is_right_erasing = true;
+                        self.drag_start_voxels.clear();
+                        self.history.begin_group();
+                        self.last_grid_coord = None;
+                        if self.tool == Tool::Build && self.modifiers.control_key() {
+                            // Ctrl+Shift+Right-drag erases a plane-locked rectangle.
+                            self.begin_rect(true);
+                        } else if self.tool == Tool::Bucket {
+                            self.handle_bucket(); // shift held -> erases the region
+                        } else {
+                            self.handle_click(true);
+                        }
+                        self.update_overlay();
+                        true
+                    }
+                    winit::event::MouseButton::Right if !pressed && self.is_right_erasing => {
+                        self.is_right_erasing = false;
+                        // Commit any in-progress rectangle erase.
                         if self.rect_drag.is_some() {
                             self.commit_rect();
                         }
                         self.history.end_group();
                         self.last_grid_coord = None;
                         self.drag_start_voxels.clear();
+                        self.update_overlay();
+                        true
                     }
-                    self.update_overlay();
+                    _ => self.camera_controller.process_events(event),
                 }
-                self.camera_controller.process_events(event)
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
@@ -614,7 +689,12 @@ impl State {
                         KeyCode::Digit8 if !*repeat => { self.current_color_index = 8; return true; }
                         KeyCode::Digit9 if !*repeat => { self.current_color_index = 9; return true; }
                         KeyCode::KeyB if !ctrl && !*repeat => {
-                            self.tool = if self.tool == Tool::Bucket { Tool::Brush } else { Tool::Bucket };
+                            // Cycle Build -> Paint -> Bucket -> Build.
+                            self.tool = match self.tool {
+                                Tool::Build => Tool::Paint,
+                                Tool::Paint => Tool::Bucket,
+                                Tool::Bucket => Tool::Build,
+                            };
                             return true;
                         }
                         KeyCode::KeyS if ctrl && self.modifiers.shift_key() && !*repeat => { self.save_project_as(); return true; }
@@ -624,7 +704,11 @@ impl State {
                         KeyCode::KeyZ if ctrl => {
                             if !self.is_undo_pressed {
                                 self.undo();
-                                self.last_action_time = std::time::Duration::ZERO; // Initial undo immediate
+                                // Stamp "now" so the first auto-repeat waits a
+                                // full delay. Stamping ZERO would make the next
+                                // `update` see a huge gap and fire immediately,
+                                // undoing a second step per tap.
+                                self.last_action_time = self.last_update_time;
                                 self.is_undo_pressed = true;
                             }
                             return true;
@@ -632,7 +716,7 @@ impl State {
                         KeyCode::KeyY if ctrl => {
                             if !self.is_redo_pressed {
                                 self.redo();
-                                self.last_action_time = std::time::Duration::ZERO; // Initial redo immediate
+                                self.last_action_time = self.last_update_time;
                                 self.is_redo_pressed = true;
                             }
                             return true;
@@ -658,17 +742,18 @@ impl State {
         }
     }
 
-    fn handle_click(&mut self) {
+    /// Applies one click. `erase` (driven by Shift+Right) clears the hit voxel;
+    /// otherwise the active tool decides: Build places against the hit face,
+    /// Paint recolors the hit voxel in place (never adds geometry).
+    fn handle_click(&mut self, erase: bool) {
         let ray_dir = self.screen_to_ray(self.cursor_position);
         let ray_origin = self.camera.eye;
 
         if let Some((pos, normal, is_drag_voxel)) = self.raycast(ray_origin, ray_dir) {
-            let coord = if self.modifiers.shift_key() {
-                // Remove the voxel that was hit.
-                pos
-            } else if is_drag_voxel {
-                // If we hit a voxel from the same drag session, don't add the normal.
-                // This prevents stacking (staircases) while still allowing the voxel to block the ray.
+            let paint = self.tool == Tool::Paint;
+            let coord = if erase || paint || is_drag_voxel {
+                // Erase and paint act on the hit voxel itself; so does a hit on
+                // a voxel from this same drag session (prevents staircasing).
                 pos
             } else {
                 // Place a new voxel against the hit face, one cell along the normal.
@@ -681,21 +766,27 @@ impl State {
             if Some(coord) == self.last_grid_coord {
                 return;
             }
-            let color_index = if self.modifiers.shift_key() { 0 } else { self.current_color_index };
+            // Paint only recolors solid voxels; it never fills empty space.
+            if paint && !erase && !self.solid_at(coord) {
+                return;
+            }
+            let color_index = if erase { 0 } else { self.current_color_index };
             if self.set_voxel(coord[0], coord[1], coord[2], Voxel { color_index }, false) {
                 self.last_grid_coord = Some(coord);
             }
         }
     }
 
-    fn handle_drag(&mut self) {
+    /// Continues a stroke from the last grid cell to the one under the cursor,
+    /// filling the gap with a 3D line so fast drags don't leave holes. `erase`
+    /// and the active tool mean the same thing as in [`handle_click`].
+    fn handle_drag(&mut self, erase: bool) {
         let ray_dir = self.screen_to_ray(self.cursor_position);
         let ray_origin = self.camera.eye;
 
         if let Some((pos, normal, is_drag_voxel)) = self.raycast(ray_origin, ray_dir) {
-            let current_coord = if self.modifiers.shift_key() {
-                pos
-            } else if is_drag_voxel {
+            let paint = self.tool == Tool::Paint;
+            let current_coord = if erase || paint || is_drag_voxel {
                 pos
             } else {
                 [
@@ -704,6 +795,7 @@ impl State {
                     pos[2] + normal[2] as i32,
                 ]
             };
+            let color_index = if erase { 0 } else { self.current_color_index };
 
             if let Some(last_coord) = self.last_grid_coord {
                 if current_coord != last_coord {
@@ -731,34 +823,37 @@ impl State {
 
                         for i in 0..=steps as i32 {
                             let coord = [cx.round() as i32, cy.round() as i32, cz.round() as i32];
-                            // Skip the first coordinate if it's the one we just placed in handle_click
-                            // or the last one from handle_drag.
-                            if i == 0 && Some(coord) == self.last_grid_coord {
-                                cx += x_inc;
-                                cy += y_inc;
-                                cz += z_inc;
-                                continue;
-                            }
-                            let color_index = if self.modifiers.shift_key() { 0 } else { self.current_color_index };
-                            self.set_voxel(coord[0], coord[1], coord[2], Voxel { color_index }, true);
                             cx += x_inc;
                             cy += y_inc;
                             cz += z_inc;
+                            // Skip the first coordinate if it's the one we just placed in handle_click
+                            // or the last one from handle_drag.
+                            if i == 0 && Some(coord) == self.last_grid_coord {
+                                continue;
+                            }
+                            // Paint skips empty cells along the line so a stroke
+                            // recolors only the voxels it actually crosses.
+                            if paint && !erase && !self.solid_at(coord) {
+                                continue;
+                            }
+                            self.set_voxel(coord[0], coord[1], coord[2], Voxel { color_index }, true);
                         }
                     }
                     self.last_grid_coord = Some(current_coord);
                 }
             } else {
-                let color_index = if self.modifiers.shift_key() { 0 } else { self.current_color_index };
-                self.set_voxel(current_coord[0], current_coord[1], current_coord[2], Voxel { color_index }, false);
+                if !(paint && !erase && !self.solid_at(current_coord)) {
+                    self.set_voxel(current_coord[0], current_coord[1], current_coord[2], Voxel { color_index }, false);
+                }
                 self.last_grid_coord = Some(current_coord);
             }
         }
     }
 
     /// Casts the cursor ray and starts a rectangle drag, locking the fill plane
-    /// to the face that was hit. Does nothing if the ray misses the world.
-    fn begin_rect(&mut self) {
+    /// to the face that was hit. `remove` chooses fill vs. erase. Does nothing
+    /// if the ray misses the world.
+    fn begin_rect(&mut self, remove: bool) {
         let ray_dir = self.screen_to_ray(self.cursor_position);
         let ray_origin = self.camera.eye;
 
@@ -772,7 +867,6 @@ impl State {
             };
             let u_axis = (axis + 1) % 3;
             let v_axis = (axis + 2) % 3;
-            let remove = self.modifiers.shift_key();
             // Erase acts on the hit voxel's own plane; place acts on the cell
             // one step along the normal.
             let place_value = if remove { pos[axis] } else { pos[axis] + normal[axis] as i32 };
@@ -949,8 +1043,9 @@ impl State {
                 } else {
                     pos[axis] as f32
                 };
+                // Shift highlights the voxel the eyedropper would sample.
                 let color = if self.modifiers.shift_key() {
-                    [1.0, 0.3, 0.3]
+                    [0.4, 1.0, 0.4]
                 } else {
                     [1.0, 1.0, 1.0]
                 };
@@ -976,6 +1071,36 @@ impl State {
                     usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 },
             );
+        }
+    }
+
+    /// Whether `coord` is in-bounds and holds a non-empty voxel.
+    fn solid_at(&self, coord: [i32; 3]) -> bool {
+        if coord[0] < 0 || coord[1] < 0 || coord[2] < 0 {
+            return false;
+        }
+        self.chunk
+            .get(coord[0] as usize, coord[1] as usize, coord[2] as usize)
+            .is_some_and(|v| !v.is_empty())
+    }
+
+    /// Eyedropper: read the color index of the voxel under the cursor and make
+    /// it the active color. Does nothing unless the cursor is over a solid voxel.
+    fn pick_color(&mut self) {
+        let ray_dir = self.screen_to_ray(self.cursor_position);
+        let ray_origin = self.camera.eye;
+        let Some((pos, _normal, _)) = self.raycast(ray_origin, ray_dir) else {
+            return;
+        };
+        if pos[0] < 0 || pos[1] < 0 || pos[2] < 0 {
+            return; // boundary-only hit, no voxel to sample
+        }
+        if let Some(v) = self
+            .chunk
+            .get(pos[0] as usize, pos[1] as usize, pos[2] as usize)
+            .filter(|v| !v.is_empty())
+        {
+            self.current_color_index = v.color_index;
         }
     }
 
@@ -1341,6 +1466,9 @@ impl State {
     }
 
     pub fn update(&mut self, dt: std::time::Duration) {
+        // Remember the latest clock so the key handlers can schedule the first
+        // auto-repeat relative to "now" rather than the start of the program.
+        self.last_update_time = dt;
         if self.is_undo_pressed && dt - self.last_action_time >= crate::ACTION_REPEAT_DELAY {
             self.undo();
             self.last_action_time = dt;
@@ -1487,10 +1615,16 @@ impl State {
                 ui.label("Tool");
                 ui.horizontal(|ui| {
                     if ui
-                        .selectable_label(self.tool == Tool::Brush, "🖌 Brush")
+                        .selectable_label(self.tool == Tool::Build, "🔨 Build")
                         .clicked()
                     {
-                        self.tool = Tool::Brush;
+                        self.tool = Tool::Build;
+                    }
+                    if ui
+                        .selectable_label(self.tool == Tool::Paint, "🖌 Paint")
+                        .clicked()
+                    {
+                        self.tool = Tool::Paint;
                     }
                     if ui
                         .selectable_label(self.tool == Tool::Bucket, "🪣 Bucket")
@@ -1521,21 +1655,15 @@ impl State {
                 ui.label(format!("Active color: #{}", self.current_color_index));
 
                 // Recolor the selected palette slot; existing voxels of that
-                // color update immediately via a remesh.
+                // color update immediately via a remesh. The picker works in
+                // sRGB *byte* space (`_srgb`), the same values we store and draw
+                // the swatches with — `color_edit_button_rgb` would instead read
+                // the floats as linear and show a brighter, mismatched color.
                 let idx = self.current_color_index as usize;
                 let c = self.palette.colors[idx];
-                let mut rgb = [
-                    c[0] as f32 / 255.0,
-                    c[1] as f32 / 255.0,
-                    c[2] as f32 / 255.0,
-                ];
-                if ui.color_edit_button_rgb(&mut rgb).changed() {
-                    self.palette.colors[idx] = [
-                        (rgb[0] * 255.0).round() as u8,
-                        (rgb[1] * 255.0).round() as u8,
-                        (rgb[2] * 255.0).round() as u8,
-                        255,
-                    ];
+                let mut srgb = [c[0], c[1], c[2]];
+                if ui.color_edit_button_srgb(&mut srgb).changed() {
+                    self.palette.colors[idx] = [srgb[0], srgb[1], srgb[2], 255];
                     self.remesh();
                 }
 
@@ -1620,14 +1748,15 @@ impl State {
                 });
 
                 ui.menu_button("Help", |ui| {
-                    ui.label("Left-click: place");
-                    ui.label("Shift + Left-click: remove");
+                    ui.label("Left-click: build / paint (active tool)");
+                    ui.label("Shift + Right-click: erase");
+                    ui.label("Shift + Left-click: eyedropper (pick color)");
                     ui.label("Right-drag: orbit");
                     ui.label("Middle-drag: pan · Scroll: zoom");
-                    ui.label("Ctrl + Left-drag: fill rectangle");
-                    ui.label("Ctrl + Shift + Left-drag: erase rectangle");
-                    ui.label("B: toggle brush/bucket");
-                    ui.label("Bucket click: fill region · Shift: erase region");
+                    ui.label("Ctrl + Left-drag: fill rectangle (Build)");
+                    ui.label("Ctrl + Shift + Right-drag: erase rectangle");
+                    ui.label("B: cycle Build / Paint / Bucket");
+                    ui.label("Bucket: click fills region · Shift + Right erases it");
                 });
             });
         });
