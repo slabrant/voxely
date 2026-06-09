@@ -51,3 +51,9 @@ fn fs_line(in: VertexOutput) -> @location(0) vec4<f32> {
 fn fs_highlight(in: VertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(in.color, 0.35);
 }
+
+@fragment
+fn fs_xray(in: VertexOutput) -> @location(0) vec4<f32> {
+    // Dimmer and more transparent for hidden parts
+    return vec4<f32>(in.color * 0.5, 0.15);
+}

@@ -24,6 +24,7 @@ pub struct State {
     render_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
     highlight_pipeline: wgpu::RenderPipeline,
+    xray_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     line_vertex_buffer: wgpu::Buffer,
@@ -61,8 +62,10 @@ pub struct State {
     is_undo_pressed: bool,
     is_redo_pressed: bool,
     last_grid_coord: Option<[i32; 3]>,
+    extrude_start: Option<(Vec<[i32; 3]>, [i32; 3], u8)>, // (positions, normal, color_index)
     drag_start_voxels: Vec<[i32; 3]>,
     rect_drag: Option<RectDrag>,
+    extrude_steps: Option<i32>,
     tool: Tool,
     /// Canvas dimensions edited in the UI, applied on "Resize".
     pending_size: [usize; 3],
@@ -82,6 +85,8 @@ enum Tool {
     Paint,
     /// Flood-fill a connected region of one color (click to apply).
     Bucket,
+    /// Pull a face along its normal (click and drag).
+    Extrude,
 }
 
 /// State for an in-progress ctrl+left-drag rectangle fill.
@@ -425,6 +430,47 @@ impl State {
             multiview: None,
         });
 
+        // X-ray pipeline for parts of the overlay that are occluded by geometry.
+        // Uses Greater depth comparison and a dimmer fragment shader.
+        let xray_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("X-ray Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[
+                    Vertex::desc(),
+                ],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_xray",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: Texture::DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Greater,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+        });
+
         let depth_texture = Texture::create_depth_texture(&device, &config, "depth_texture");
 
         let camera_controller = CameraController::new();
@@ -501,6 +547,7 @@ impl State {
             render_pipeline,
             line_pipeline,
             highlight_pipeline,
+            xray_pipeline,
             vertex_buffer,
             index_buffer,
             line_vertex_buffer,
@@ -531,8 +578,10 @@ impl State {
             is_undo_pressed: false,
             is_redo_pressed: false,
             last_grid_coord: None,
+            extrude_start: None,
             drag_start_voxels: Vec::new(),
             rect_drag: None,
+            extrude_steps: None,
             tool: Tool::Build,
             pending_size: [chunk_w, chunk_h, chunk_d],
             current_path: None,
@@ -566,6 +615,8 @@ impl State {
                 if self.is_left_mouse_pressed && !self.is_eyedropping {
                     if self.rect_drag.is_some() {
                         self.update_rect();
+                    } else if self.tool == Tool::Extrude {
+                        self.handle_extrude_drag(false);
                     } else if self.tool != Tool::Bucket {
                         // Build and Paint both stroke along the drag; Bucket is
                         // click-only.
@@ -577,6 +628,8 @@ impl State {
                 if self.is_right_erasing {
                     if self.rect_drag.is_some() {
                         self.update_rect();
+                    } else if self.tool == Tool::Extrude {
+                        self.handle_extrude_drag(true);
                     } else if self.tool != Tool::Bucket {
                         self.handle_drag(true);
                     }
@@ -602,6 +655,8 @@ impl State {
                                 self.history.begin_group();
                                 if self.tool == Tool::Bucket {
                                     self.handle_bucket();
+                                } else if self.tool == Tool::Extrude {
+                                    self.handle_extrude_click(false);
                                 } else if self.tool == Tool::Build && self.modifiers.control_key() {
                                     // Ctrl+Left-drag fills a plane-locked rectangle.
                                     // (Erasing a rectangle lives on Ctrl+Shift+Right.)
@@ -618,6 +673,11 @@ impl State {
                             if self.rect_drag.is_some() {
                                 self.commit_rect();
                             }
+                            if self.extrude_start.is_some() {
+                                self.commit_extrude();
+                            }
+                            self.extrude_start = None;
+                            self.extrude_steps = None;
                             self.history.end_group();
                             self.last_grid_coord = None;
                             self.drag_start_voxels.clear();
@@ -639,6 +699,8 @@ impl State {
                             self.begin_rect(true);
                         } else if self.tool == Tool::Bucket {
                             self.handle_bucket(); // shift held -> erases the region
+                        } else if self.tool == Tool::Extrude {
+                            self.handle_extrude_click(true);
                         } else {
                             self.handle_click(true);
                         }
@@ -651,6 +713,11 @@ impl State {
                         if self.rect_drag.is_some() {
                             self.commit_rect();
                         }
+                        if self.extrude_start.is_some() {
+                            self.commit_extrude();
+                        }
+                        self.extrude_start = None;
+                        self.extrude_steps = None;
                         self.history.end_group();
                         self.last_grid_coord = None;
                         self.drag_start_voxels.clear();
@@ -689,11 +756,12 @@ impl State {
                         KeyCode::Digit8 if !*repeat => { self.current_color_index = 8; return true; }
                         KeyCode::Digit9 if !*repeat => { self.current_color_index = 9; return true; }
                         KeyCode::KeyB if !ctrl && !*repeat => {
-                            // Cycle Build -> Paint -> Bucket -> Build.
+                            // Cycle Build -> Paint -> Bucket -> Extrude -> Build.
                             self.tool = match self.tool {
                                 Tool::Build => Tool::Paint,
                                 Tool::Paint => Tool::Bucket,
-                                Tool::Bucket => Tool::Build,
+                                Tool::Bucket => Tool::Extrude,
+                                Tool::Extrude => Tool::Build,
                             };
                             return true;
                         }
@@ -1006,6 +1074,125 @@ impl State {
         }
     }
 
+    fn handle_extrude_click(&mut self, erase: bool) {
+        let ray_dir = self.screen_to_ray(self.cursor_position);
+        let ray_origin = self.camera.eye;
+
+        if let Some((pos, normal, _)) = self.raycast(ray_origin, ray_dir) {
+            if let Some(v) = self.chunk.get(pos[0] as usize, pos[1] as usize, pos[2] as usize) {
+                if !v.is_empty() {
+                    let normal_i = [normal[0] as i32, normal[1] as i32, normal[2] as i32];
+                    let target_color = v.color_index;
+                    
+                    // Flood fill on the surface to find all connected voxels of the same color
+                    // that have the same exposed face.
+                    let mut surface_voxels = Vec::new();
+                    let mut stack = vec![pos];
+                    let mut visited = std::collections::HashSet::new();
+                    visited.insert(pos);
+                    
+                    let axis = if normal_i[0] != 0 { 0 } else if normal_i[1] != 0 { 1 } else { 2 };
+                    let u_axis = (axis + 1) % 3;
+                    let v_axis = (axis + 2) % 3;
+
+                    while let Some(curr) = stack.pop() {
+                        surface_voxels.push(curr);
+                        
+                        // Check 4 neighbors on the same plane
+                        for (du, dv) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                            let mut next = curr;
+                            next[u_axis] += du;
+                            next[v_axis] += dv;
+                            
+                            if !visited.contains(&next) {
+                                if let Some(nv) = self.chunk.get(next[0] as usize, next[1] as usize, next[2] as usize) {
+                                    if nv.color_index == target_color {
+                                        // Check if this voxel also has an exposed face in the same direction.
+                                        // A face is exposed if the neighbor in the normal direction is empty.
+                                        let neighbor_pos = [
+                                            next[0] + normal_i[0],
+                                            next[1] + normal_i[1],
+                                            next[2] + normal_i[2],
+                                        ];
+                                        let is_exposed = self.chunk.get(
+                                            neighbor_pos[0] as i32 as usize,
+                                            neighbor_pos[1] as i32 as usize,
+                                            neighbor_pos[2] as i32 as usize
+                                        ).map(|v| v.is_empty()).unwrap_or(true);
+                                        
+                                        if is_exposed {
+                                            visited.insert(next);
+                                            stack.push(next);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let color_index = if erase { 0 } else { target_color };
+                    self.extrude_start = Some((surface_voxels, normal_i, color_index));
+                    self.extrude_steps = Some(0);
+                    self.last_grid_coord = Some(pos);
+                }
+            }
+        }
+    }
+
+    fn handle_extrude_drag(&mut self, _erase: bool) {
+        // No-op during drag; we just use the overlay to show where it will be.
+    }
+
+    fn commit_extrude(&mut self) {
+        let (surface_voxels, normal, color_index) = match &self.extrude_start {
+            Some(s) => s,
+            None => return,
+        };
+        let surface_voxels = surface_voxels.clone();
+        let normal = *normal;
+        let color_index = *color_index;
+
+        let ray_dir = self.screen_to_ray(self.cursor_position);
+        let ray_origin = self.camera.eye;
+
+        let start_pos = surface_voxels[0];
+        let dist = (glam::Vec3::new(start_pos[0] as f32, start_pos[1] as f32, start_pos[2] as f32) - ray_origin).length();
+        let plane_point = ray_origin + ray_dir * dist;
+        let diff = plane_point - glam::Vec3::new(start_pos[0] as f32, start_pos[1] as f32, start_pos[2] as f32);
+        let t = diff.dot(glam::Vec3::new(normal[0] as f32, normal[1] as f32, normal[2] as f32));
+
+        let steps = t.round() as i32;
+        if steps == 0 {
+            return;
+        }
+
+        if steps > 0 {
+            for i in 1..=steps {
+                for &pos in &surface_voxels {
+                    let coord = [
+                        pos[0] + normal[0] * i,
+                        pos[1] + normal[1] * i,
+                        pos[2] + normal[2] * i,
+                    ];
+                    self.set_voxel(coord[0], coord[1], coord[2], Voxel { color_index }, true);
+                }
+            }
+        } else {
+            // Negative steps means unextruding. Erase from i=0 down to steps.
+            // i=0 is the current surface.
+            for i in 0..=steps.abs() {
+                for &pos in &surface_voxels {
+                    let coord = [
+                        pos[0] - normal[0] * i,
+                        pos[1] - normal[1] * i,
+                        pos[2] - normal[2] * i,
+                    ];
+                    self.set_voxel(coord[0], coord[1], coord[2], Voxel { color_index: 0 }, true);
+                }
+            }
+        }
+    }
+
     /// Rebuilds the overlay vertex buffer for the current frame: the rectangle
     /// preview while dragging, otherwise the hover-face highlight under the
     /// cursor. Empty when the cursor isn't over the world.
@@ -1025,6 +1212,49 @@ impl State {
             let mut dv = [0.0f32; 3];
             dv[rd.v_axis] = (v1 - v0 + 1) as f32;
             push_overlay_quad(&mut verts, base, du, dv, rd.normal, color);
+        } else if let Some((surface_voxels, normal, _)) = &self.extrude_start {
+            let ray_dir = self.screen_to_ray(self.cursor_position);
+            let ray_origin = self.camera.eye;
+            let start_pos = surface_voxels[0];
+            let dist = (glam::Vec3::new(start_pos[0] as f32, start_pos[1] as f32, start_pos[2] as f32) - ray_origin).length();
+            let plane_point = ray_origin + ray_dir * dist;
+            let diff = plane_point - glam::Vec3::new(start_pos[0] as f32, start_pos[1] as f32, start_pos[2] as f32);
+            let t = diff.dot(glam::Vec3::new(normal[0] as f32, normal[1] as f32, normal[2] as f32));
+            let steps = t.round() as i32;
+
+            if Some(steps) == self.extrude_steps {
+                return;
+            }
+            self.extrude_steps = Some(steps);
+            self.num_overlay_vertices = 0; // Force a rebuild if we didn't return early
+
+            let color = if self.is_right_erasing { [1.0, 0.3, 0.3] } else { [0.4, 0.8, 1.0] };
+            let axis = if normal[0] != 0 { 0 } else if normal[1] != 0 { 1 } else { 2 };
+            let u_axis = (axis + 1) % 3;
+            let v_axis = (axis + 2) % 3;
+            let face_normal = [normal[0] as f32, normal[1] as f32, normal[2] as f32];
+
+            let sign = if steps > 0 { 1 } else { -1 };
+            let offset = steps.abs() * sign;
+            
+            for &pos in surface_voxels {
+                let mut base = [0.0f32; 3];
+                // The face world depends on the normal.
+                let face_world = if normal[axis] > 0 {
+                    (pos[axis] + 1 + offset) as f32
+                } else {
+                    (pos[axis] - offset) as f32
+                };
+                
+                base[axis] = face_world;
+                base[u_axis] = pos[u_axis] as f32;
+                base[v_axis] = pos[v_axis] as f32;
+                let mut du = [0.0f32; 3];
+                du[u_axis] = 1.0;
+                let mut dv = [0.0f32; 3];
+                dv[v_axis] = 1.0;
+                push_overlay_quad(&mut verts, base, du, dv, face_normal, color);
+            }
         } else if !self.is_left_mouse_pressed {
             let ray_dir = self.screen_to_ray(self.cursor_position);
             let ray_origin = self.camera.eye;
@@ -1063,14 +1293,20 @@ impl State {
 
         self.num_overlay_vertices = verts.len() as u32;
         if !verts.is_empty() {
-            use wgpu::util::DeviceExt;
-            self.overlay_vertex_buffer = self.device.create_buffer_init(
-                &wgpu::util::BufferInitDescriptor {
-                    label: Some("Overlay Vertex Buffer"),
-                    contents: bytemuck::cast_slice(&verts),
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                },
-            );
+            // Re-allocate the buffer only if the vertex count has grown, 
+            // otherwise just update the existing one to avoid allocation lag.
+            if verts.len() as u32 > self.overlay_vertex_buffer.size() as u32 / std::mem::size_of::<Vertex>() as u32 {
+                use wgpu::util::DeviceExt;
+                self.overlay_vertex_buffer = self.device.create_buffer_init(
+                    &wgpu::util::BufferInitDescriptor {
+                        label: Some("Overlay Vertex Buffer"),
+                        contents: bytemuck::cast_slice(&verts),
+                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    },
+                );
+            } else {
+                self.queue.write_buffer(&self.overlay_vertex_buffer, 0, bytemuck::cast_slice(&verts));
+            }
         }
     }
 
@@ -1563,6 +1799,12 @@ impl State {
 
             // Draw the hover/rectangle overlay on top of the scene.
             if self.num_overlay_vertices > 0 {
+                // First pass: draw parts occluded by geometry (dimmer, visible through walls).
+                render_pass.set_pipeline(&self.xray_pipeline);
+                render_pass.set_vertex_buffer(0, self.overlay_vertex_buffer.slice(..));
+                render_pass.draw(0..self.num_overlay_vertices, 0..1);
+
+                // Second pass: draw visible parts (brighter).
                 render_pass.set_pipeline(&self.highlight_pipeline);
                 render_pass.set_vertex_buffer(0, self.overlay_vertex_buffer.slice(..));
                 render_pass.draw(0..self.num_overlay_vertices, 0..1);
@@ -1631,6 +1873,12 @@ impl State {
                         .clicked()
                     {
                         self.tool = Tool::Bucket;
+                    }
+                    if ui
+                        .selectable_label(self.tool == Tool::Extrude, "⇗ Extrude")
+                        .clicked()
+                    {
+                        self.tool = Tool::Extrude;
                     }
                 });
 
