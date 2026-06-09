@@ -1156,9 +1156,9 @@ impl State {
         let ray_origin = self.camera.eye;
 
         let start_pos = surface_voxels[0];
-        let dist = (glam::Vec3::new(start_pos[0] as f32, start_pos[1] as f32, start_pos[2] as f32) - ray_origin).length();
+        let dist = (glam::Vec3::new(start_pos[0] as f32 + 0.5, start_pos[1] as f32 + 0.5, start_pos[2] as f32 + 0.5) - ray_origin).length();
         let plane_point = ray_origin + ray_dir * dist;
-        let diff = plane_point - glam::Vec3::new(start_pos[0] as f32, start_pos[1] as f32, start_pos[2] as f32);
+        let diff = plane_point - glam::Vec3::new(start_pos[0] as f32 + 0.5, start_pos[1] as f32 + 0.5, start_pos[2] as f32 + 0.5);
         let t = diff.dot(glam::Vec3::new(normal[0] as f32, normal[1] as f32, normal[2] as f32));
 
         let steps = t.round() as i32;
@@ -1180,7 +1180,7 @@ impl State {
         } else {
             // Negative steps means unextruding. Erase from i=0 down to steps.
             // i=0 is the current surface.
-            for i in 0..=steps.abs() {
+            for i in 0..steps.abs() {
                 for &pos in &surface_voxels {
                     let coord = [
                         pos[0] - normal[0] * i,
@@ -1216,9 +1216,9 @@ impl State {
             let ray_dir = self.screen_to_ray(self.cursor_position);
             let ray_origin = self.camera.eye;
             let start_pos = surface_voxels[0];
-            let dist = (glam::Vec3::new(start_pos[0] as f32, start_pos[1] as f32, start_pos[2] as f32) - ray_origin).length();
+            let dist = (glam::Vec3::new(start_pos[0] as f32 + 0.5, start_pos[1] as f32 + 0.5, start_pos[2] as f32 + 0.5) - ray_origin).length();
             let plane_point = ray_origin + ray_dir * dist;
-            let diff = plane_point - glam::Vec3::new(start_pos[0] as f32, start_pos[1] as f32, start_pos[2] as f32);
+            let diff = plane_point - glam::Vec3::new(start_pos[0] as f32 + 0.5, start_pos[1] as f32 + 0.5, start_pos[2] as f32 + 0.5);
             let t = diff.dot(glam::Vec3::new(normal[0] as f32, normal[1] as f32, normal[2] as f32));
             let steps = t.round() as i32;
 
