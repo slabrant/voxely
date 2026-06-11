@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mingw-w64
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Windows
+        run: cargo build --target x86_64-pc-windows-gnu --release
+
+      - name: Build Linux
+        run: cargo build --release
+
+      - name: Package artifacts
+        run: |
+          mkdir -p dist
+          cp target/x86_64-pc-windows-gnu/release/voxely.exe dist/voxely-windows-x86_64.exe
+          cp target/release/voxely dist/voxely-linux-x86_64
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: Build ${{ github.run_number }}
+          files: dist/*
