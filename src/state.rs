@@ -48,19 +48,23 @@ pub struct State {
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
     is_left_mouse_pressed: bool,
-    /// True while a Shift+Right erase gesture is in progress (click or drag).
-    /// The camera is suppressed for the duration so the view doesn't orbit.
-    is_right_erasing: bool,
-    /// True while a Shift+Left eyedropper gesture is in progress, so cursor
-    /// motion isn't mistaken for a paint/build drag.
+    /// Latched erase mode for the in-progress left-button gesture (Shift held
+    /// at press). Kept stable for the whole gesture so releasing Shift mid-drag
+    /// doesn't flip a stroke between place and erase.
+    drag_erase: bool,
+    /// True while an eyedropper click is in progress (Alt+Left, or a click
+    /// while armed), so cursor motion isn't mistaken for a paint/build drag.
     is_eyedropping: bool,
-    last_action_time: std::time::Duration,
-    /// Most recent elapsed-time stamp handed to [`update`](Self::update). The
-    /// key handlers read it to schedule the *first* undo/redo auto-repeat one
-    /// `ACTION_REPEAT_DELAY` after the press (they have no clock of their own).
-    last_update_time: std::time::Duration,
-    is_undo_pressed: bool,
-    is_redo_pressed: bool,
+    /// Set by tapping `Q`: the next left-click samples the color under the
+    /// cursor instead of editing, then disarms. `Esc` cancels.
+    eyedropper_armed: bool,
+    /// True for the duration of a freehand (Build/Paint) erase stroke. While
+    /// set, [`raycast`](Self::raycast) treats `erased_cells` as solid so the
+    /// stroke stops at the surface it's carving instead of tunnelling deeper.
+    is_erasing_gesture: bool,
+    /// Cells cleared so far by the current freehand erase stroke. Reset when
+    /// the gesture ends.
+    erased_cells: std::collections::HashSet<[i32; 3]>,
     last_grid_coord: Option<[i32; 3]>,
     extrude_start: Option<(Vec<[i32; 3]>, [i32; 3], u8)>, // (positions, normal, color_index)
     drag_start_voxels: Vec<[i32; 3]>,
@@ -78,7 +82,7 @@ pub struct State {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tool {
     /// Add voxels: left-click/drag places (and ctrl-drag fills a rectangle).
-    /// Geometry only — erasing lives on Shift+Right-click for every tool.
+    /// Geometry only — erasing lives on Shift+Left-click for every tool.
     Build,
     /// Recolor existing voxels to the active color. Never adds or removes
     /// geometry: clicks/drags over empty space do nothing.
@@ -571,12 +575,11 @@ impl State {
             egui_state,
             egui_renderer,
             is_left_mouse_pressed: false,
-            is_right_erasing: false,
+            drag_erase: false,
             is_eyedropping: false,
-            last_action_time: std::time::Duration::ZERO,
-            last_update_time: std::time::Duration::ZERO,
-            is_undo_pressed: false,
-            is_redo_pressed: false,
+            eyedropper_armed: false,
+            is_erasing_gesture: false,
+            erased_cells: std::collections::HashSet::new(),
             last_grid_coord: None,
             extrude_start: None,
             drag_start_voxels: Vec::new(),
@@ -601,6 +604,27 @@ impl State {
     }
 
     pub fn input(&mut self, event: &WindowEvent) -> bool {
+        // Tab cycles tools (Shift+Tab reverse). Intercept it *before* egui,
+        // which would otherwise consume Tab to move focus between panel
+        // widgets. While egui is capturing the keyboard (e.g. editing a
+        // canvas-size field) we defer, so Tab still moves between fields there.
+        if let WindowEvent::KeyboardInput {
+            event:
+                winit::event::KeyEvent {
+                    state: winit::event::ElementState::Pressed,
+                    physical_key: winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Tab),
+                    repeat: false,
+                    ..
+                },
+            ..
+        } = event
+        {
+            if !self.egui_ctx.wants_keyboard_input() {
+                self.cycle_tool(self.modifiers.shift_key());
+                return true;
+            }
+        }
+
         // Let egui handle the event first; if it's consumed (e.g. a click on a
         // panel), don't also treat it as a scene/camera interaction.
         if self.egui_state.on_window_event(&self.window, event).consumed {
@@ -613,25 +637,15 @@ impl State {
                 self.camera_controller.handle_mouse_motion(dx, dy);
                 self.cursor_position = *position;
                 if self.is_left_mouse_pressed && !self.is_eyedropping {
+                    let erase = self.drag_erase;
                     if self.rect_drag.is_some() {
                         self.update_rect();
                     } else if self.tool == Tool::Extrude {
-                        self.handle_extrude_drag(false);
+                        self.handle_extrude_drag(erase);
                     } else if self.tool != Tool::Bucket {
                         // Build and Paint both stroke along the drag; Bucket is
                         // click-only.
-                        self.handle_drag(false);
-                    }
-                }
-                // Shift+Right-drag erases: a rectangle if one is in progress,
-                // otherwise a continuous stroke (Bucket already flooded on press).
-                if self.is_right_erasing {
-                    if self.rect_drag.is_some() {
-                        self.update_rect();
-                    } else if self.tool == Tool::Extrude {
-                        self.handle_extrude_drag(true);
-                    } else if self.tool != Tool::Bucket {
-                        self.handle_drag(true);
+                        self.handle_drag(erase);
                     }
                 }
                 self.update_overlay();
@@ -640,89 +654,77 @@ impl State {
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = *state == winit::event::ElementState::Pressed;
                 match button {
+                    // The left button carries every editing gesture, with
+                    // modifiers composing on top of the active tool (and the
+                    // click samples color when the eyedropper is armed):
+                    //   Alt        -> eyedropper (where the WM allows it)
+                    //   Shift      -> erase
+                    //   Ctrl       -> rectangle (Build)
+                    //   Ctrl+Shift -> erase rectangle (Build)
+                    // The right button is camera-orbit only.
                     winit::event::MouseButton::Left => {
-                        self.is_left_mouse_pressed = pressed;
                         if pressed {
-                            if self.modifiers.shift_key() && !self.modifiers.control_key() {
-                                // Shift+Left-click is the eyedropper: adopt the
-                                // color under the cursor. No edit -> no history.
+                            let ctrl = self.modifiers.control_key();
+                            let shift = self.modifiers.shift_key();
+                            let alt = self.modifiers.alt_key();
+                            self.is_left_mouse_pressed = true;
+                            if self.eyedropper_armed || (alt && !ctrl && !shift) {
+                                // Eyedropper: adopt the color under the cursor,
+                                // either armed (tapped `I`) or via Alt+Left where
+                                // the WM allows it. No edit -> no history.
                                 self.pick_color();
+                                self.eyedropper_armed = false;
                                 self.is_eyedropping = true;
                             } else {
+                                let erase = shift;
+                                self.drag_erase = erase;
+                                self.is_erasing_gesture = false;
+                                self.erased_cells.clear();
                                 self.drag_start_voxels.clear();
+                                self.last_grid_coord = None;
                                 // Every gesture (click, drag, rectangle, bucket)
                                 // is one undo step; bracket it here, close on release.
                                 self.history.begin_group();
                                 if self.tool == Tool::Bucket {
-                                    self.handle_bucket();
+                                    self.handle_bucket(erase);
                                 } else if self.tool == Tool::Extrude {
-                                    self.handle_extrude_click(false);
-                                } else if self.tool == Tool::Build && self.modifiers.control_key() {
-                                    // Ctrl+Left-drag fills a plane-locked rectangle.
-                                    // (Erasing a rectangle lives on Ctrl+Shift+Right.)
-                                    self.begin_rect(false);
+                                    self.handle_extrude_click(erase);
+                                } else if self.tool == Tool::Build && ctrl {
+                                    // Ctrl+Left-drag fills a plane-locked
+                                    // rectangle; +Shift erases it instead.
+                                    self.begin_rect(erase);
                                 } else {
-                                    self.handle_click(false);
+                                    // Freehand stroke. An erase stroke carves the
+                                    // visible surface without drilling through:
+                                    // see `is_erasing_gesture` / `raycast`.
+                                    self.is_erasing_gesture = erase;
+                                    self.handle_click(erase);
                                 }
                             }
-                        } else if self.is_eyedropping {
-                            self.is_eyedropping = false;
-                            self.last_grid_coord = None;
                         } else {
-                            // Releasing the button commits any in-progress rectangle.
-                            if self.rect_drag.is_some() {
-                                self.commit_rect();
+                            self.is_left_mouse_pressed = false;
+                            if self.is_eyedropping {
+                                self.is_eyedropping = false;
+                                self.last_grid_coord = None;
+                            } else {
+                                // Releasing the button commits any in-progress rectangle.
+                                if self.rect_drag.is_some() {
+                                    self.commit_rect();
+                                }
+                                if self.extrude_start.is_some() {
+                                    self.commit_extrude();
+                                }
+                                self.extrude_start = None;
+                                self.extrude_steps = None;
+                                self.history.end_group();
+                                self.last_grid_coord = None;
+                                self.drag_start_voxels.clear();
+                                self.is_erasing_gesture = false;
+                                self.erased_cells.clear();
                             }
-                            if self.extrude_start.is_some() {
-                                self.commit_extrude();
-                            }
-                            self.extrude_start = None;
-                            self.extrude_steps = None;
-                            self.history.end_group();
-                            self.last_grid_coord = None;
-                            self.drag_start_voxels.clear();
                         }
                         self.update_overlay();
                         self.camera_controller.process_events(event)
-                    }
-                    // Shift+Right starts an erase gesture: a rectangle erase when
-                    // Ctrl is also held (Build), a region flood in Bucket mode,
-                    // otherwise the voxel/stroke under the cursor. Consumed so the
-                    // camera doesn't also orbit.
-                    winit::event::MouseButton::Right if pressed && self.modifiers.shift_key() => {
-                        self.is_right_erasing = true;
-                        self.drag_start_voxels.clear();
-                        self.history.begin_group();
-                        self.last_grid_coord = None;
-                        if self.tool == Tool::Build && self.modifiers.control_key() {
-                            // Ctrl+Shift+Right-drag erases a plane-locked rectangle.
-                            self.begin_rect(true);
-                        } else if self.tool == Tool::Bucket {
-                            self.handle_bucket(); // shift held -> erases the region
-                        } else if self.tool == Tool::Extrude {
-                            self.handle_extrude_click(true);
-                        } else {
-                            self.handle_click(true);
-                        }
-                        self.update_overlay();
-                        true
-                    }
-                    winit::event::MouseButton::Right if !pressed && self.is_right_erasing => {
-                        self.is_right_erasing = false;
-                        // Commit any in-progress rectangle erase.
-                        if self.rect_drag.is_some() {
-                            self.commit_rect();
-                        }
-                        if self.extrude_start.is_some() {
-                            self.commit_extrude();
-                        }
-                        self.extrude_start = None;
-                        self.extrude_steps = None;
-                        self.history.end_group();
-                        self.last_grid_coord = None;
-                        self.drag_start_voxels.clear();
-                        self.update_overlay();
-                        true
                     }
                     _ => self.camera_controller.process_events(event),
                 }
@@ -755,47 +757,27 @@ impl State {
                         KeyCode::Digit7 if !*repeat => { self.current_color_index = 7; return true; }
                         KeyCode::Digit8 if !*repeat => { self.current_color_index = 8; return true; }
                         KeyCode::Digit9 if !*repeat => { self.current_color_index = 9; return true; }
-                        KeyCode::KeyB if !ctrl && !*repeat => {
-                            // Cycle Build -> Paint -> Bucket -> Extrude -> Build.
-                            self.tool = match self.tool {
-                                Tool::Build => Tool::Paint,
-                                Tool::Paint => Tool::Bucket,
-                                Tool::Bucket => Tool::Extrude,
-                                Tool::Extrude => Tool::Build,
-                            };
+                        KeyCode::KeyQ if !ctrl && !*repeat => {
+                            // Arm the eyedropper: the next left-click samples the
+                            // color under the cursor. Tap again to cancel. Q sits
+                            // just below Tab, in the tool/color key cluster.
+                            self.eyedropper_armed = !self.eyedropper_armed;
+                            return true;
+                        }
+                        KeyCode::Escape if !*repeat && self.eyedropper_armed => {
+                            self.eyedropper_armed = false;
                             return true;
                         }
                         KeyCode::KeyS if ctrl && self.modifiers.shift_key() && !*repeat => { self.save_project_as(); return true; }
                         KeyCode::KeyS if ctrl && !*repeat => { self.save_project(); return true; }
                         KeyCode::KeyO if ctrl && !*repeat => { self.open_file(); return true; }
                         KeyCode::KeyE if ctrl && !*repeat => { self.export_obj(); return true; }
-                        KeyCode::KeyZ if ctrl => {
-                            if !self.is_undo_pressed {
-                                self.undo();
-                                // Stamp "now" so the first auto-repeat waits a
-                                // full delay. Stamping ZERO would make the next
-                                // `update` see a huge gap and fire immediately,
-                                // undoing a second step per tap.
-                                self.last_action_time = self.last_update_time;
-                                self.is_undo_pressed = true;
-                            }
-                            return true;
-                        }
-                        KeyCode::KeyY if ctrl => {
-                            if !self.is_redo_pressed {
-                                self.redo();
-                                self.last_action_time = self.last_update_time;
-                                self.is_redo_pressed = true;
-                            }
-                            return true;
-                        }
-                        _ => {}
-                    }
-                } else {
-                    // Released
-                    match key {
-                        KeyCode::KeyZ => self.is_undo_pressed = false,
-                        KeyCode::KeyY => self.is_redo_pressed = false,
+                        // One undo/redo per press: the `!*repeat` guard ignores
+                        // the OS key-repeat stream while the key is held. The
+                        // Ctrl+Shift+Z redo arm must precede the plain Ctrl+Z.
+                        KeyCode::KeyZ if ctrl && self.modifiers.shift_key() && !*repeat => { self.redo(); return true; }
+                        KeyCode::KeyZ if ctrl && !*repeat => { self.undo(); return true; }
+                        KeyCode::KeyY if ctrl && !*repeat => { self.redo(); return true; }
                         _ => {}
                     }
                 }
@@ -810,10 +792,35 @@ impl State {
         }
     }
 
-    /// Applies one click. `erase` (driven by Shift+Right) clears the hit voxel;
-    /// otherwise the active tool decides: Build places against the hit face,
-    /// Paint recolors the hit voxel in place (never adds geometry).
+    /// Switches to the next tool, or the previous one when `reverse` is set
+    /// (Shift+Tab). Order: Build → Paint → Bucket → Extrude → Build.
+    fn cycle_tool(&mut self, reverse: bool) {
+        self.tool = if reverse {
+            match self.tool {
+                Tool::Build => Tool::Extrude,
+                Tool::Paint => Tool::Build,
+                Tool::Bucket => Tool::Paint,
+                Tool::Extrude => Tool::Bucket,
+            }
+        } else {
+            match self.tool {
+                Tool::Build => Tool::Paint,
+                Tool::Paint => Tool::Bucket,
+                Tool::Bucket => Tool::Extrude,
+                Tool::Extrude => Tool::Build,
+            }
+        };
+    }
+
+    /// Applies one click. `erase` (Shift held) clears the hit voxel; otherwise
+    /// the active tool decides: Build places against the hit face, Paint
+    /// recolors the hit voxel in place (never adds *or* removes geometry).
     fn handle_click(&mut self, erase: bool) {
+        // Paint only ever recolors, so erasing in Paint mode is a no-op; switch
+        // to Build to remove geometry.
+        if erase && self.tool == Tool::Paint {
+            return;
+        }
         let ray_dir = self.screen_to_ray(self.cursor_position);
         let ray_origin = self.camera.eye;
 
@@ -849,6 +856,9 @@ impl State {
     /// filling the gap with a 3D line so fast drags don't leave holes. `erase`
     /// and the active tool mean the same thing as in [`handle_click`].
     fn handle_drag(&mut self, erase: bool) {
+        if erase && self.tool == Tool::Paint {
+            return;
+        }
         let ray_dir = self.screen_to_ray(self.cursor_position);
         let ray_origin = self.camera.eye;
 
@@ -865,6 +875,8 @@ impl State {
             };
             let color_index = if erase { 0 } else { self.current_color_index };
 
+            // Bulk-write the stroke and remesh once at the end (see `write_voxel`).
+            let mut changed = false;
             if let Some(last_coord) = self.last_grid_coord {
                 if current_coord != last_coord {
                     // 3D DDA Line Algorithm
@@ -904,16 +916,19 @@ impl State {
                             if paint && !erase && !self.solid_at(coord) {
                                 continue;
                             }
-                            self.set_voxel(coord[0], coord[1], coord[2], Voxel { color_index }, true);
+                            changed |= self.write_voxel(coord[0], coord[1], coord[2], Voxel { color_index }, true);
                         }
                     }
                     self.last_grid_coord = Some(current_coord);
                 }
             } else {
                 if !(paint && !erase && !self.solid_at(current_coord)) {
-                    self.set_voxel(current_coord[0], current_coord[1], current_coord[2], Voxel { color_index }, false);
+                    changed |= self.write_voxel(current_coord[0], current_coord[1], current_coord[2], Voxel { color_index }, false);
                 }
                 self.last_grid_coord = Some(current_coord);
+            }
+            if changed {
+                self.remesh();
             }
         }
     }
@@ -1009,20 +1024,24 @@ impl State {
         let color_index = if rd.remove { 0 } else { self.current_color_index };
         let mut coord = [0i32; 3];
         coord[rd.axis] = rd.place_value;
+        let mut changed = false;
         for u in u0..=u1 {
             for v in v0..=v1 {
                 coord[rd.u_axis] = u;
                 coord[rd.v_axis] = v;
-                self.set_voxel(coord[0], coord[1], coord[2], Voxel { color_index }, true);
+                changed |= self.write_voxel(coord[0], coord[1], coord[2], Voxel { color_index }, true);
             }
+        }
+        if changed {
+            self.remesh();
         }
     }
 
     /// Paint-bucket flood fill: recolors the connected region (6-adjacency) of
-    /// voxels sharing the clicked voxel's color. Holding shift erases the region
-    /// instead. The whole flood is recorded as a single undo group by the
+    /// voxels sharing the clicked voxel's color. `erase` (Shift held) clears the
+    /// region instead. The whole flood is recorded as a single undo group by the
     /// caller. Does nothing if the cursor isn't over a solid voxel.
-    fn handle_bucket(&mut self) {
+    fn handle_bucket(&mut self, erase: bool) {
         let (cw, ch, cd) = (self.chunk.width, self.chunk.height, self.chunk.depth);
         let ray_dir = self.screen_to_ray(self.cursor_position);
         let ray_origin = self.camera.eye;
@@ -1036,7 +1055,7 @@ impl State {
             Some(v) if !v.is_empty() => v.color_index,
             _ => return,
         };
-        let new_color = if self.modifiers.shift_key() { 0 } else { self.current_color_index };
+        let new_color = if erase { 0 } else { self.current_color_index };
         if new_color == target {
             return;
         }
@@ -1143,6 +1162,31 @@ impl State {
         // No-op during drag; we just use the overlay to show where it will be.
     }
 
+    /// How many voxel layers the cursor currently maps to along the extrude
+    /// axis. Finds the point on the extrude axis (the line through
+    /// `start_center` along the unit `normal`) closest to the cursor ray, and
+    /// returns its signed distance from `start_center` in voxel units, rounded.
+    ///
+    /// This is the standard closest-points-of-two-lines result. Because it
+    /// measures displacement *along the axis* rather than projecting the cursor
+    /// out to the start voxel's eye-distance (the old approach), screen motion
+    /// tracks the extruded distance roughly 1:1 instead of needing a long drag.
+    fn extrude_steps_for_cursor(&self, start_center: glam::Vec3, normal: glam::Vec3) -> i32 {
+        let ray_dir = self.screen_to_ray(self.cursor_position);
+        let w0 = start_center - self.camera.eye;
+        // `normal` and `ray_dir` are both unit length, so a = c = 1.
+        let b = normal.dot(ray_dir); // n·d == cos(angle between axis and ray)
+        let denom = 1.0 - b * b; // sin²(angle); → 0 when sighting down the axis
+        if denom.abs() < 1e-3 {
+            // Ray nearly parallel to the extrude axis: depth is ill-defined, so
+            // hold the last value rather than jumping.
+            return self.extrude_steps.unwrap_or(0);
+        }
+        let d = normal.dot(w0);
+        let e = ray_dir.dot(w0);
+        ((b * e - d) / denom).round() as i32
+    }
+
     fn commit_extrude(&mut self) {
         let (surface_voxels, normal, color_index) = match &self.extrude_start {
             Some(s) => s,
@@ -1152,20 +1196,21 @@ impl State {
         let normal = *normal;
         let color_index = *color_index;
 
-        let ray_dir = self.screen_to_ray(self.cursor_position);
-        let ray_origin = self.camera.eye;
-
         let start_pos = surface_voxels[0];
-        let dist = (glam::Vec3::new(start_pos[0] as f32 + 0.5, start_pos[1] as f32 + 0.5, start_pos[2] as f32 + 0.5) - ray_origin).length();
-        let plane_point = ray_origin + ray_dir * dist;
-        let diff = plane_point - glam::Vec3::new(start_pos[0] as f32 + 0.5, start_pos[1] as f32 + 0.5, start_pos[2] as f32 + 0.5);
-        let t = diff.dot(glam::Vec3::new(normal[0] as f32, normal[1] as f32, normal[2] as f32));
-
-        let steps = t.round() as i32;
+        let start_center = glam::Vec3::new(
+            start_pos[0] as f32 + 0.5,
+            start_pos[1] as f32 + 0.5,
+            start_pos[2] as f32 + 0.5,
+        );
+        let normal_v = glam::Vec3::new(normal[0] as f32, normal[1] as f32, normal[2] as f32);
+        let steps = self.extrude_steps_for_cursor(start_center, normal_v);
         if steps == 0 {
             return;
         }
 
+        // Write every layer, then remesh once: extruding many voxels otherwise
+        // rebuilt the whole mesh per voxel and stalled the app.
+        let mut changed = false;
         if steps > 0 {
             for i in 1..=steps {
                 for &pos in &surface_voxels {
@@ -1174,7 +1219,7 @@ impl State {
                         pos[1] + normal[1] * i,
                         pos[2] + normal[2] * i,
                     ];
-                    self.set_voxel(coord[0], coord[1], coord[2], Voxel { color_index }, true);
+                    changed |= self.write_voxel(coord[0], coord[1], coord[2], Voxel { color_index }, true);
                 }
             }
         } else {
@@ -1187,9 +1232,12 @@ impl State {
                         pos[1] - normal[1] * i,
                         pos[2] - normal[2] * i,
                     ];
-                    self.set_voxel(coord[0], coord[1], coord[2], Voxel { color_index: 0 }, true);
+                    changed |= self.write_voxel(coord[0], coord[1], coord[2], Voxel { color_index: 0 }, true);
                 }
             }
+        }
+        if changed {
+            self.remesh();
         }
     }
 
@@ -1213,14 +1261,14 @@ impl State {
             dv[rd.v_axis] = (v1 - v0 + 1) as f32;
             push_overlay_quad(&mut verts, base, du, dv, rd.normal, color);
         } else if let Some((surface_voxels, normal, _)) = &self.extrude_start {
-            let ray_dir = self.screen_to_ray(self.cursor_position);
-            let ray_origin = self.camera.eye;
             let start_pos = surface_voxels[0];
-            let dist = (glam::Vec3::new(start_pos[0] as f32 + 0.5, start_pos[1] as f32 + 0.5, start_pos[2] as f32 + 0.5) - ray_origin).length();
-            let plane_point = ray_origin + ray_dir * dist;
-            let diff = plane_point - glam::Vec3::new(start_pos[0] as f32 + 0.5, start_pos[1] as f32 + 0.5, start_pos[2] as f32 + 0.5);
-            let t = diff.dot(glam::Vec3::new(normal[0] as f32, normal[1] as f32, normal[2] as f32));
-            let steps = t.round() as i32;
+            let start_center = glam::Vec3::new(
+                start_pos[0] as f32 + 0.5,
+                start_pos[1] as f32 + 0.5,
+                start_pos[2] as f32 + 0.5,
+            );
+            let normal_v = glam::Vec3::new(normal[0] as f32, normal[1] as f32, normal[2] as f32);
+            let steps = self.extrude_steps_for_cursor(start_center, normal_v);
 
             if Some(steps) == self.extrude_steps {
                 return;
@@ -1228,7 +1276,7 @@ impl State {
             self.extrude_steps = Some(steps);
             self.num_overlay_vertices = 0; // Force a rebuild if we didn't return early
 
-            let color = if self.is_right_erasing { [1.0, 0.3, 0.3] } else { [0.4, 0.8, 1.0] };
+            let color = if self.drag_erase { [1.0, 0.3, 0.3] } else { [0.4, 0.8, 1.0] };
             let axis = if normal[0] != 0 { 0 } else if normal[1] != 0 { 1 } else { 2 };
             let u_axis = (axis + 1) % 3;
             let v_axis = (axis + 2) % 3;
@@ -1273,9 +1321,12 @@ impl State {
                 } else {
                     pos[axis] as f32
                 };
-                // Shift highlights the voxel the eyedropper would sample.
-                let color = if self.modifiers.shift_key() {
+                // Green marks the voxel the eyedropper would sample (armed, or
+                // Alt held); red marks the erase target (Shift).
+                let color = if self.eyedropper_armed || self.modifiers.alt_key() {
                     [0.4, 1.0, 0.4]
+                } else if self.modifiers.shift_key() {
+                    [1.0, 0.4, 0.4]
                 } else {
                     [1.0, 1.0, 1.0]
                 };
@@ -1340,9 +1391,11 @@ impl State {
         }
     }
 
-    /// Sets a voxel, recording the change for undo and re-meshing only if
-    /// something actually changed. Coordinates outside the chunk are ignored.
-    fn set_voxel(&mut self, x: i32, y: i32, z: i32, voxel: Voxel, is_drag: bool) -> bool {
+    /// Core voxel write: updates the chunk and undo history, returning whether
+    /// anything changed. Does *not* remesh, so callers doing bulk edits
+    /// (rectangle, extrude, drag strokes) rebuild the mesh once at the end
+    /// rather than once per voxel. Coordinates outside the chunk are ignored.
+    fn write_voxel(&mut self, x: i32, y: i32, z: i32, voxel: Voxel, is_drag: bool) -> bool {
         if x < 0 || y < 0 || z < 0 {
             return false;
         }
@@ -1356,9 +1409,13 @@ impl State {
         }
         self.chunk.set(xu, yu, zu, voxel);
 
-        // Record voxels placed during this drag session to exclude them from raycasting
         if self.is_left_mouse_pressed && !voxel.is_empty() {
+            // Voxels placed this drag session are excluded from raycasting.
             self.drag_start_voxels.push([x, y, z]);
+        } else if self.is_erasing_gesture && voxel.is_empty() {
+            // Cells cleared this erase stroke keep blocking the ray (see
+            // `raycast`), so the stroke carves the surface without tunnelling.
+            self.erased_cells.insert([x, y, z]);
         }
 
         if is_drag {
@@ -1366,8 +1423,17 @@ impl State {
         } else {
             self.history.record(VoxelEdit { x: xu, y: yu, z: zu, old, new: voxel });
         }
-        self.remesh();
         true
+    }
+
+    /// Like [`write_voxel`](Self::write_voxel) but remeshes immediately. For
+    /// one-off single-voxel edits (a click, the head of a stroke).
+    fn set_voxel(&mut self, x: i32, y: i32, z: i32, voxel: Voxel, is_drag: bool) -> bool {
+        let changed = self.write_voxel(x, y, z, voxel, is_drag);
+        if changed {
+            self.remesh();
+        }
+        changed
     }
 
     fn undo(&mut self) {
@@ -1438,11 +1504,17 @@ impl State {
         let mut t = 0.0;
         while t < max_dist {
             if ip[0] >= 0 && ip[1] >= 0 && ip[2] >= 0 {
-                if let Some(voxel) = self.chunk.get(ip[0] as usize, ip[1] as usize, ip[2] as usize) {
-                    if !voxel.is_empty() {
-                        let is_drag_voxel = self.drag_start_voxels.contains(&ip);
-                        return Some((ip, normal, is_drag_voxel));
-                    }
+                let solid = self
+                    .chunk
+                    .get(ip[0] as usize, ip[1] as usize, ip[2] as usize)
+                    .is_some_and(|v| !v.is_empty());
+                // During an erase stroke, cells already cleared this gesture
+                // still stop the ray, so the stroke carves the surface it
+                // started on instead of tunnelling through the model.
+                let blocked = self.is_erasing_gesture && self.erased_cells.contains(&ip);
+                if solid || blocked {
+                    let is_drag_voxel = self.drag_start_voxels.contains(&ip);
+                    return Some((ip, normal, is_drag_voxel));
                 }
             }
             // Advance to the next cell along whichever axis has the nearest
@@ -1701,20 +1773,7 @@ impl State {
         }
     }
 
-    pub fn update(&mut self, dt: std::time::Duration) {
-        // Remember the latest clock so the key handlers can schedule the first
-        // auto-repeat relative to "now" rather than the start of the program.
-        self.last_update_time = dt;
-        if self.is_undo_pressed && dt - self.last_action_time >= crate::ACTION_REPEAT_DELAY {
-            self.undo();
-            self.last_action_time = dt;
-        }
-
-        if self.is_redo_pressed && dt - self.last_action_time >= crate::ACTION_REPEAT_DELAY {
-            self.redo();
-            self.last_action_time = dt;
-        }
-
+    pub fn update(&mut self) {
         self.camera_controller.update_camera(&mut self.camera);
         self.camera_uniform.update_view_projection(&self.camera);
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[self.camera_uniform]));
@@ -1882,6 +1941,20 @@ impl State {
                     }
                 });
 
+                // Eyedropper is modal: tapping `Q` arms it; the next click samples.
+                if ui
+                    .selectable_label(self.eyedropper_armed, "💧 Eyedropper (Q)")
+                    .clicked()
+                {
+                    self.eyedropper_armed = !self.eyedropper_armed;
+                }
+                if self.eyedropper_armed {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(102, 255, 102),
+                        "Click a voxel to sample its color",
+                    );
+                }
+
                 ui.add_space(6.0);
                 ui.label("History");
                 ui.horizontal(|ui| {
@@ -1997,14 +2070,14 @@ impl State {
 
                 ui.menu_button("Help", |ui| {
                     ui.label("Left-click: build / paint (active tool)");
-                    ui.label("Shift + Right-click: erase");
-                    ui.label("Shift + Left-click: eyedropper (pick color)");
+                    ui.label("Shift + Left-click: erase");
+                    ui.label("Q, then click: eyedropper (pick color)");
                     ui.label("Right-drag: orbit");
                     ui.label("Middle-drag: pan · Scroll: zoom");
                     ui.label("Ctrl + Left-drag: fill rectangle (Build)");
-                    ui.label("Ctrl + Shift + Right-drag: erase rectangle");
-                    ui.label("B: cycle Build / Paint / Bucket");
-                    ui.label("Bucket: click fills region · Shift + Right erases it");
+                    ui.label("Ctrl + Shift + Left-drag: erase rectangle");
+                    ui.label("Tab / Shift + Tab: cycle tools");
+                    ui.label("Bucket: click fills region · Shift + Left erases it");
                 });
             });
         });

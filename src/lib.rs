@@ -12,18 +12,15 @@ pub mod editor;
 pub mod io;
 pub mod render;
 
-pub const ACTION_REPEAT_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
-
     pub async fn run() {
     env_logger::init();
-    let start_time = std::time::Instant::now();
 
     println!("--- Voxely Quick Start ---");
     println!("Orbit: Right-Click + Drag  |  Pan: Middle-Click + Drag  |  Zoom: Scroll");
-    println!("Build/Paint: Left-Click    |  Erase: Shift + Right-Click");
-    println!("Eyedropper: Shift + Left-Click  |  Cycle Tool: B");
+    println!("Build/Paint: Left-Click    |  Erase: Shift + Left-Click");
+    println!("Eyedropper: Press Q, then Left-Click  |  Cycle Tool: Tab / Shift+Tab");
     println!("Change Color: 1-9");
-    println!("Undo: Ctrl+Z  |  Redo: Ctrl+Y");
+    println!("Undo: Ctrl+Z  |  Redo: Ctrl+Y or Ctrl+Shift+Z");
     println!("Save: Ctrl+S  |  Save As: Ctrl+Shift+S  |  Open: Ctrl+O");
     println!("Export .obj: Ctrl+E");
     println!("--------------------------");
@@ -52,7 +49,7 @@ pub const ACTION_REPEAT_DELAY: std::time::Duration = std::time::Duration::from_m
                             state.resize(*physical_size);
                         }
                         WindowEvent::RedrawRequested => {
-                            state.update(start_time.elapsed());
+                            state.update();
                             match state.render() {
                                 Ok(_) => {}
                                 // Reconfigure the surface if lost
