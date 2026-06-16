@@ -328,8 +328,9 @@ pub fn export_obj(path: impl AsRef<Path>, chunk: &Chunk, palette: &Palette) -> R
     }
 
     let mut vbase = 0u32;
-    for (&color, group) in &by_color {
-        writeln!(obj, "usemtl mat{color}")?;
+    for (slot, (&_color, group)) in by_color.iter().enumerate() {
+        let mtl_name_local = format!("mtl{}", slot + 1);
+        writeln!(obj, "usemtl {mtl_name_local}")?;
         for q in group {
             for c in q.corners {
                 writeln!(
@@ -351,9 +352,9 @@ pub fn export_obj(path: impl AsRef<Path>, chunk: &Chunk, palette: &Palette) -> R
     }
 
     let mut mtl = String::from("# Exported by Voxely\n");
-    for &color in by_color.keys() {
+    for (slot, &color) in by_color.keys().enumerate() {
         let c = palette.colors.get(color as usize).copied().unwrap_or([255, 255, 255, 255]);
-        writeln!(mtl, "newmtl mat{color}")?;
+        writeln!(mtl, "newmtl mtl{}", slot + 1)?;
         writeln!(
             mtl,
             "Kd {:.4} {:.4} {:.4}",
@@ -387,10 +388,10 @@ mod tests {
         // we get six quads, each with its own four (unshared) vertices.
         assert_eq!(obj.lines().filter(|l| l.starts_with("f ")).count(), 6, "six exposed faces");
         assert_eq!(obj.lines().filter(|l| l.starts_with("v ")).count(), 24, "6 quads x 4 verts");
-        assert!(obj.contains("usemtl mat1"));
+        assert!(obj.contains("usemtl mtl1"));
 
         let mtl = std::fs::read_to_string(dir.join("voxely_test_export.mtl")).unwrap();
-        assert!(mtl.contains("newmtl mat1"));
+        assert!(mtl.contains("newmtl mtl1"));
 
         let _ = std::fs::remove_file(&obj_path);
         let _ = std::fs::remove_file(dir.join("voxely_test_export.mtl"));
