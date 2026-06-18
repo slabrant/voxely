@@ -32,11 +32,46 @@ jobs:
       - name: Build Linux
         run: cargo build --release
 
+      # Package the Linux build as an AppImage: one double-clickable file that
+      # carries the icon + .desktop and registers a menu entry on first run, so
+      # there's no loose icon to ship. Replaces the bare ELF binary.
+      - name: Package Linux AppImage
+        run: |
+          # AppDir layout: binary under usr/bin; icon + .desktop at the root (the
+          # icon's name must match the .desktop's Icon= key); AppRun is the entry point.
+          APPDIR=build/AppDir
+          mkdir -p "$APPDIR/usr/bin"
+          cp target/release/voxely "$APPDIR/usr/bin/voxely"
+          chmod +x "$APPDIR/usr/bin/voxely"
+          cp icon.png "$APPDIR/voxely.png"
+          cat > "$APPDIR/voxely.desktop" <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Voxely
+          Exec=voxely
+          Icon=voxely
+          Categories=Graphics;3DGraphics;
+          Terminal=false
+          EOF
+          cat > "$APPDIR/AppRun" <<'EOF'
+          #!/bin/bash
+          HERE="$(dirname "$(readlink -f "$0")")"
+          exec "$HERE/usr/bin/voxely" "$@"
+          EOF
+          chmod +x "$APPDIR/AppRun"
+          # appimagetool is itself an AppImage; APPIMAGE_EXTRACT_AND_RUN lets it run
+          # on the runner without FUSE.
+          curl -L --retry 5 --retry-delay 10 --retry-all-errors --max-time 120 \
+            -o "$RUNNER_TEMP/appimagetool" \
+            "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+          chmod +x "$RUNNER_TEMP/appimagetool"
+          APPIMAGE_EXTRACT_AND_RUN=1 "$RUNNER_TEMP/appimagetool" "$APPDIR" build/voxely-x86_64.AppImage
+
       - name: Package artifacts
         run: |
           mkdir -p dist
           cp target/x86_64-pc-windows-gnu/release/voxely.exe dist/voxely-windows-x86_64.exe
-          cp target/release/voxely dist/voxely-linux-x86_64
+          cp build/voxely-x86_64.AppImage dist/voxely-x86_64.AppImage
 
       - name: Create release
         uses: softprops/action-gh-release@v2

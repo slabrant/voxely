@@ -67,6 +67,12 @@ pub struct State {
     erased_cells: std::collections::HashSet<[i32; 3]>,
     last_grid_coord: Option<[i32; 3]>,
     extrude_start: Option<(Vec<[i32; 3]>, [i32; 3], u8)>, // (positions, normal, color_index)
+    /// In-progress Move gesture: the grabbed object plus the axis it slides
+    /// along. `None` when no move is underway.
+    move_start: Option<MoveDrag>,
+    /// Step count the Move overlay was last drawn for, so cursor motion that
+    /// doesn't change the snapped offset skips a rebuild.
+    move_steps: Option<i32>,
     drag_start_voxels: Vec<[i32; 3]>,
     rect_drag: Option<RectDrag>,
     extrude_steps: Option<i32>,
@@ -91,6 +97,10 @@ enum Tool {
     Bucket,
     /// Pull a face along its normal (click and drag).
     Extrude,
+    /// Slide a whole connected object along the clicked face's normal (click and
+    /// drag). The grabbed object is every voxel reachable from the hit one
+    /// through shared faces, regardless of color.
+    Move,
 }
 
 /// State for an in-progress ctrl+left-drag rectangle fill.
@@ -113,6 +123,19 @@ struct RectDrag {
     cur_u: i32,
     cur_v: i32,
     remove: bool,
+}
+
+/// State for an in-progress Move drag (the [`Tool::Move`] gesture).
+///
+/// `voxels` is the grabbed connected object captured at grab time — each cell's
+/// position and color — so the move is independent of edits made by the slide
+/// itself. `normal` is the unit integer axis the object slides along (the
+/// clicked face's normal), and `anchor_center` is the world-space center of the
+/// clicked voxel, the reference point for mapping the cursor to a step count.
+struct MoveDrag {
+    voxels: Vec<([i32; 3], u8)>,
+    normal: [i32; 3],
+    anchor_center: glam::Vec3,
 }
 
 pub struct Texture {
@@ -582,6 +605,8 @@ impl State {
             erased_cells: std::collections::HashSet::new(),
             last_grid_coord: None,
             extrude_start: None,
+            move_start: None,
+            move_steps: None,
             drag_start_voxels: Vec::new(),
             rect_drag: None,
             extrude_steps: None,
@@ -640,7 +665,9 @@ impl State {
                     let erase = self.drag_erase;
                     if self.rect_drag.is_some() {
                         self.update_rect();
-                    } else if self.tool == Tool::Extrude {
+                    } else if self.tool == Tool::Extrude || self.tool == Tool::Move {
+                        // Both are click-and-drag along an axis; the live preview
+                        // is rebuilt in `update_overlay`, so nothing to do here.
                         self.handle_extrude_drag(erase);
                     } else if self.tool != Tool::Bucket {
                         // Build and Paint both stroke along the drag; Bucket is
@@ -689,6 +716,10 @@ impl State {
                                     self.handle_bucket(erase);
                                 } else if self.tool == Tool::Extrude {
                                     self.handle_extrude_click(erase);
+                                } else if self.tool == Tool::Move {
+                                    // Grab the whole connected object under the
+                                    // cursor; the drag slides it (commit on release).
+                                    self.handle_move_click();
                                 } else if self.tool == Tool::Build && ctrl {
                                     // Ctrl+Left-drag fills a plane-locked
                                     // rectangle; +Shift erases it instead.
@@ -714,8 +745,13 @@ impl State {
                                 if self.extrude_start.is_some() {
                                     self.commit_extrude();
                                 }
+                                if self.move_start.is_some() {
+                                    self.commit_move();
+                                }
                                 self.extrude_start = None;
                                 self.extrude_steps = None;
+                                self.move_start = None;
+                                self.move_steps = None;
                                 self.history.end_group();
                                 self.last_grid_coord = None;
                                 self.drag_start_voxels.clear();
@@ -793,21 +829,23 @@ impl State {
     }
 
     /// Switches to the next tool, or the previous one when `reverse` is set
-    /// (Shift+Tab). Order: Build → Paint → Bucket → Extrude → Build.
+    /// (Shift+Tab). Order: Build → Paint → Bucket → Extrude → Move → Build.
     fn cycle_tool(&mut self, reverse: bool) {
         self.tool = if reverse {
             match self.tool {
-                Tool::Build => Tool::Extrude,
+                Tool::Build => Tool::Move,
                 Tool::Paint => Tool::Build,
                 Tool::Bucket => Tool::Paint,
                 Tool::Extrude => Tool::Bucket,
+                Tool::Move => Tool::Extrude,
             }
         } else {
             match self.tool {
                 Tool::Build => Tool::Paint,
                 Tool::Paint => Tool::Bucket,
                 Tool::Bucket => Tool::Extrude,
-                Tool::Extrude => Tool::Build,
+                Tool::Extrude => Tool::Move,
+                Tool::Move => Tool::Build,
             }
         };
     }
@@ -1162,25 +1200,27 @@ impl State {
         // No-op during drag; we just use the overlay to show where it will be.
     }
 
-    /// How many voxel layers the cursor currently maps to along the extrude
-    /// axis. Finds the point on the extrude axis (the line through
-    /// `start_center` along the unit `normal`) closest to the cursor ray, and
-    /// returns its signed distance from `start_center` in voxel units, rounded.
+    /// How many voxel steps the cursor currently maps to along an axis. Finds
+    /// the point on the axis (the line through `start_center` along the unit
+    /// `normal`) closest to the cursor ray, and returns its signed distance from
+    /// `start_center` in voxel units, rounded. `fallback` is returned when the
+    /// ray sights nearly down the axis (depth ill-defined). Shared by Extrude
+    /// (layers pulled) and Move (cells slid).
     ///
     /// This is the standard closest-points-of-two-lines result. Because it
     /// measures displacement *along the axis* rather than projecting the cursor
     /// out to the start voxel's eye-distance (the old approach), screen motion
-    /// tracks the extruded distance roughly 1:1 instead of needing a long drag.
-    fn extrude_steps_for_cursor(&self, start_center: glam::Vec3, normal: glam::Vec3) -> i32 {
+    /// tracks the distance roughly 1:1 instead of needing a long drag.
+    fn steps_along_axis(&self, start_center: glam::Vec3, normal: glam::Vec3, fallback: i32) -> i32 {
         let ray_dir = self.screen_to_ray(self.cursor_position);
         let w0 = start_center - self.camera.eye;
         // `normal` and `ray_dir` are both unit length, so a = c = 1.
         let b = normal.dot(ray_dir); // n·d == cos(angle between axis and ray)
         let denom = 1.0 - b * b; // sin²(angle); → 0 when sighting down the axis
         if denom.abs() < 1e-3 {
-            // Ray nearly parallel to the extrude axis: depth is ill-defined, so
-            // hold the last value rather than jumping.
-            return self.extrude_steps.unwrap_or(0);
+            // Ray nearly parallel to the axis: depth is ill-defined, so hold the
+            // last value rather than jumping.
+            return fallback;
         }
         let d = normal.dot(w0);
         let e = ray_dir.dot(w0);
@@ -1203,7 +1243,7 @@ impl State {
             start_pos[2] as f32 + 0.5,
         );
         let normal_v = glam::Vec3::new(normal[0] as f32, normal[1] as f32, normal[2] as f32);
-        let steps = self.extrude_steps_for_cursor(start_center, normal_v);
+        let steps = self.steps_along_axis(start_center, normal_v, self.extrude_steps.unwrap_or(0));
         if steps == 0 {
             return;
         }
@@ -1241,6 +1281,129 @@ impl State {
         }
     }
 
+    /// Grabs the connected object under the cursor for a Move drag. The object
+    /// is every solid voxel reachable from the hit one through shared faces
+    /// (6-neighbor flood fill), captured with its colors. The clicked face's
+    /// normal becomes the slide axis. Does nothing if the cursor isn't over a
+    /// solid voxel.
+    fn handle_move_click(&mut self) {
+        let ray_dir = self.screen_to_ray(self.cursor_position);
+        let ray_origin = self.camera.eye;
+
+        let Some((pos, normal, _)) = self.raycast(ray_origin, ray_dir) else {
+            return;
+        };
+        if !self.solid_at(pos) {
+            return;
+        }
+        let normal_i = [normal[0] as i32, normal[1] as i32, normal[2] as i32];
+        if normal_i == [0, 0, 0] {
+            // Boundary-only hit with no entered face; no axis to slide along.
+            return;
+        }
+
+        // Flood-fill the whole connected object across shared faces.
+        let mut voxels = Vec::new();
+        let mut stack = vec![pos];
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(pos);
+        while let Some(curr) = stack.pop() {
+            let color = self
+                .chunk
+                .get(curr[0] as usize, curr[1] as usize, curr[2] as usize)
+                .map(|v| v.color_index)
+                .unwrap_or(0);
+            voxels.push((curr, color));
+            for (axis, delta) in [(0, 1), (0, -1), (1, 1), (1, -1), (2, 1), (2, -1)] {
+                let mut next = curr;
+                next[axis] += delta;
+                if !visited.contains(&next) && self.solid_at(next) {
+                    visited.insert(next);
+                    stack.push(next);
+                }
+            }
+        }
+
+        let anchor_center = glam::Vec3::new(
+            pos[0] as f32 + 0.5,
+            pos[1] as f32 + 0.5,
+            pos[2] as f32 + 0.5,
+        );
+        self.move_start = Some(MoveDrag { voxels, normal: normal_i, anchor_center });
+        self.move_steps = Some(0);
+        self.last_grid_coord = Some(pos);
+    }
+
+    /// Caps a raw Move step count so no voxel of the grabbed object would leave
+    /// the canvas: the shape slides until its leading edge meets the wall, then
+    /// stops, rather than having edge voxels clipped off. Movement is purely
+    /// along the slide axis, so this is a 1-D clamp on the displacement that
+    /// keeps the object's extent on that axis within `[0, dim)`.
+    fn clamp_move_steps(&self, md: &MoveDrag, steps: i32) -> i32 {
+        let axis = if md.normal[0] != 0 {
+            0
+        } else if md.normal[1] != 0 {
+            1
+        } else {
+            2
+        };
+        let dim = match axis {
+            0 => self.chunk.width,
+            1 => self.chunk.height,
+            _ => self.chunk.depth,
+        } as i32;
+        let (mut min_p, mut max_p) = (i32::MAX, i32::MIN);
+        for (p, _) in &md.voxels {
+            min_p = min_p.min(p[axis]);
+            max_p = max_p.max(p[axis]);
+        }
+        // Displacement along the axis must keep [min_p, max_p] inside [0, dim).
+        let s = md.normal[axis]; // +1 or -1
+        let delta = (s * steps).clamp(-min_p, (dim - 1) - max_p);
+        s * delta
+    }
+
+    /// Applies the in-progress Move: clears the object's original cells, then
+    /// writes it back shifted along the slide axis. The shift is capped so the
+    /// whole object stays in-bounds (see [`clamp_move_steps`]); at the
+    /// destination it overwrites whatever was there.
+    ///
+    /// [`clamp_move_steps`]: Self::clamp_move_steps
+    fn commit_move(&mut self) {
+        let md = match &self.move_start {
+            Some(m) => m,
+            None => return,
+        };
+        let voxels = md.voxels.clone();
+        let normal = md.normal;
+        let normal_v = glam::Vec3::new(normal[0] as f32, normal[1] as f32, normal[2] as f32);
+        let raw = self.steps_along_axis(md.anchor_center, normal_v, self.move_steps.unwrap_or(0));
+        let steps = self.clamp_move_steps(md, raw);
+        if steps == 0 {
+            return;
+        }
+        let offset = [normal[0] * steps, normal[1] * steps, normal[2] * steps];
+
+        // Clear the originals first so cells the object vacates end up empty even
+        // when another part of the same object slides onto them.
+        let mut changed = false;
+        for (pos, _) in &voxels {
+            changed |= self.write_voxel(pos[0], pos[1], pos[2], Voxel { color_index: 0 }, false);
+        }
+        for (pos, color) in &voxels {
+            changed |= self.write_voxel(
+                pos[0] + offset[0],
+                pos[1] + offset[1],
+                pos[2] + offset[2],
+                Voxel { color_index: *color },
+                false,
+            );
+        }
+        if changed {
+            self.remesh();
+        }
+    }
+
     /// Rebuilds the overlay vertex buffer for the current frame: the rectangle
     /// preview while dragging, otherwise the hover-face highlight under the
     /// cursor. Empty when the cursor isn't over the world.
@@ -1268,7 +1431,7 @@ impl State {
                 start_pos[2] as f32 + 0.5,
             );
             let normal_v = glam::Vec3::new(normal[0] as f32, normal[1] as f32, normal[2] as f32);
-            let steps = self.extrude_steps_for_cursor(start_center, normal_v);
+            let steps = self.steps_along_axis(start_center, normal_v, self.extrude_steps.unwrap_or(0));
 
             if Some(steps) == self.extrude_steps {
                 return;
@@ -1302,6 +1465,51 @@ impl State {
                 let mut dv = [0.0f32; 3];
                 dv[v_axis] = 1.0;
                 push_overlay_quad(&mut verts, base, du, dv, face_normal, color);
+            }
+        } else if let Some(md) = &self.move_start {
+            // Preview the grabbed object at its slid position: draw the outer
+            // hull (each face whose neighbor in the translated set is empty).
+            let normal = md.normal;
+            let normal_v = glam::Vec3::new(normal[0] as f32, normal[1] as f32, normal[2] as f32);
+            let raw = self.steps_along_axis(md.anchor_center, normal_v, self.move_steps.unwrap_or(0));
+            let steps = self.clamp_move_steps(md, raw);
+
+            if Some(steps) == self.move_steps {
+                return;
+            }
+            self.move_steps = Some(steps);
+            self.num_overlay_vertices = 0; // Force a rebuild if we didn't return early.
+
+            let offset = [normal[0] * steps, normal[1] * steps, normal[2] * steps];
+            let moved: std::collections::HashSet<[i32; 3]> = md
+                .voxels
+                .iter()
+                .map(|(p, _)| [p[0] + offset[0], p[1] + offset[1], p[2] + offset[2]])
+                .collect();
+            let color = [1.0, 0.7, 0.2]; // orange, distinct from build/erase/extrude
+
+            for &p in &moved {
+                // One quad per exposed face (the six axis-aligned directions).
+                for (axis, dir) in [(0, 1), (0, -1), (1, 1), (1, -1), (2, 1), (2, -1)] {
+                    let mut neighbor = p;
+                    neighbor[axis] += dir;
+                    if moved.contains(&neighbor) {
+                        continue;
+                    }
+                    let u_axis = (axis + 1) % 3;
+                    let v_axis = (axis + 2) % 3;
+                    let mut base = [0.0f32; 3];
+                    base[axis] = if dir > 0 { (p[axis] + 1) as f32 } else { p[axis] as f32 };
+                    base[u_axis] = p[u_axis] as f32;
+                    base[v_axis] = p[v_axis] as f32;
+                    let mut du = [0.0f32; 3];
+                    du[u_axis] = 1.0;
+                    let mut dv = [0.0f32; 3];
+                    dv[v_axis] = 1.0;
+                    let mut face_normal = [0.0f32; 3];
+                    face_normal[axis] = dir as f32;
+                    push_overlay_quad(&mut verts, base, du, dv, face_normal, color);
+                }
             }
         } else if !self.is_left_mouse_pressed {
             let ray_dir = self.screen_to_ray(self.cursor_position);
@@ -1938,6 +2146,12 @@ impl State {
                         .clicked()
                     {
                         self.tool = Tool::Extrude;
+                    }
+                    if ui
+                        .selectable_label(self.tool == Tool::Move, "✥ Move")
+                        .clicked()
+                    {
+                        self.tool = Tool::Move;
                     }
                 });
 
