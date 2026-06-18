@@ -10,9 +10,9 @@ use winit::{
 };
 
 /// Default file name suggested in the "Save" dialog. `.vox` is the native,
-/// lossless project format; `.obj` is export-only (see `crate::io`).
+/// lossless project format; choosing an `.obj` name in the dialog exports a mesh
+/// instead (see `crate::io::save`).
 const VOX_PATH: &str = "model.vox";
-const OBJ_PATH: &str = "model.obj";
 
 pub struct State {
     surface: wgpu::Surface<'static>,
@@ -814,7 +814,6 @@ impl State {
                         KeyCode::KeyS if ctrl && self.modifiers.shift_key() && !*repeat => { self.save_project_as(); return true; }
                         KeyCode::KeyS if ctrl && !*repeat => { self.save_project(); return true; }
                         KeyCode::KeyO if ctrl && !*repeat => { self.open_file(); return true; }
-                        KeyCode::KeyE if ctrl && !*repeat => { self.export_obj(); return true; }
                         // One undo/redo per press: the `!*repeat` guard ignores
                         // the OS key-repeat stream while the key is held. The
                         // Ctrl+Shift+Z redo arm must precede the plain Ctrl+Z.
@@ -1909,17 +1908,19 @@ impl State {
         self.num_indices = mesh_indices.len() as u32;
     }
 
-    /// Save to the current `.vox` path without prompting, falling back to
-    /// `Save As` the first time (or after opening a non-`.vox` file).
+    /// Save to the current path without prompting, falling back to `Save As` the
+    /// first time.
     fn save_project(&mut self) {
         match self.current_path.clone() {
-            Some(path) => self.write_vox(&path),
+            Some(path) => self.write_path(&path),
             None => self.save_project_as(),
         }
     }
 
-    /// Save the model as a native, lossless `.vox` file via a "save as" dialog,
-    /// remembering the chosen path for subsequent plain `Save`s.
+    /// Save the model via a "save as" dialog. The chosen extension picks the
+    /// format — `.vox` for a native project or `.obj` for a Wavefront mesh — so
+    /// export lives here rather than as a separate command. The path is
+    /// remembered for subsequent plain `Save`s.
     fn save_project_as(&mut self) {
         let suggested = self
             .current_path
@@ -1928,19 +1929,21 @@ impl State {
             .and_then(|n| n.to_str())
             .unwrap_or(VOX_PATH);
         let Some(path) = rfd::FileDialog::new()
-            .set_title("Save as .vox")
+            .set_title("Save as")
             .add_filter("MagicaVoxel", &["vox"])
+            .add_filter("Wavefront OBJ", &["obj"])
             .set_file_name(suggested)
             .save_file()
         else {
             return; // user cancelled
         };
-        self.write_vox(&path);
+        self.write_path(&path);
     }
 
-    /// Write the `.vox` to `path` and adopt it as the current project path.
-    fn write_vox(&mut self, path: &std::path::Path) {
-        match crate::io::save_vox(path, &self.chunk, &self.palette) {
+    /// Write the model to `path` (format chosen by extension) and adopt it as the
+    /// current path.
+    fn write_path(&mut self, path: &std::path::Path) {
+        match crate::io::save(path, &self.chunk, &self.palette) {
             Ok(()) => {
                 println!("Saved {}", path.display());
                 self.current_path = Some(path.to_path_buf());
@@ -1965,9 +1968,8 @@ impl State {
 
     /// Load a model from `path` into the editor, replacing the current scene.
     /// Shared by the file picker, the OS "Open With" command-line argument, and
-    /// drag-and-drop. Only the native `.vox` is adopted as the save target; an
-    /// imported `.obj` leaves the path unset so the next Save prompts for a
-    /// `.vox` rather than silently overwriting the mesh.
+    /// drag-and-drop. Both openable formats (`.vox` and `.obj`) are also save
+    /// targets, so the path is adopted for subsequent plain `Save`s.
     pub fn load_path(&mut self, path: &std::path::Path) {
         match crate::io::open(path) {
             Ok(project) => {
@@ -1976,30 +1978,9 @@ impl State {
                 self.history.clear();
                 self.sync_to_chunk();
                 println!("Opened {}", path.display());
-                let is_vox = path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .is_some_and(|e| e.eq_ignore_ascii_case("vox"));
-                self.current_path = is_vox.then(|| path.to_path_buf());
+                self.current_path = Some(path.to_path_buf());
             }
             Err(e) => eprintln!("Open failed: {e}"),
-        }
-    }
-
-    fn export_obj(&self) {
-        // Ask the OS where to write via a native "save as" dialog. `.mtl` is
-        // written alongside with a matching stem by `io::export_obj`.
-        let Some(path) = rfd::FileDialog::new()
-            .set_title("Export as .obj")
-            .add_filter("Wavefront OBJ", &["obj"])
-            .set_file_name(OBJ_PATH)
-            .save_file()
-        else {
-            return; // user cancelled
-        };
-        match crate::io::export_obj(&path, &self.chunk, &self.palette) {
-            Ok(()) => println!("Exported {} (+ .mtl)", path.display()),
-            Err(e) => eprintln!("Export failed: {e}"),
         }
     }
 
@@ -2254,8 +2235,8 @@ impl State {
             });
     }
 
-    /// The top menu bar: File (open/save/export), Edit (canvas extents), and
-    /// Help (controls reference).
+    /// The top menu bar: File (open/save), Edit (canvas extents), and Help
+    /// (controls reference).
     fn build_menu_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
@@ -2270,11 +2251,6 @@ impl State {
                     }
                     if ui.button("Save As…").clicked() {
                         self.save_project_as();
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button("Export .obj…").clicked() {
-                        self.export_obj();
                         ui.close_menu();
                     }
                 });

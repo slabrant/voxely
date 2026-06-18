@@ -64,7 +64,6 @@ cargo build --release --target x86_64-pc-windows-gnu
 | Orbit / pan / zoom | Right-drag / middle-drag / scroll |
 | Undo / redo | Ctrl+Z / Ctrl+Y (or Ctrl+Shift+Z) |
 | Save / Save As / open | Ctrl+S / Ctrl+Shift+S / Ctrl+O |
-| Export `.obj` | Ctrl+E |
 
 File, Edit (canvas extents), and Help live in the top menu bar.
 

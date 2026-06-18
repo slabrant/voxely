@@ -27,6 +27,18 @@ pub fn open(path: impl AsRef<Path>) -> Result<Project, Box<dyn Error>> {
     }
 }
 
+/// Save a model, choosing the writer by extension: `.vox` (native, lossless) or
+/// `.obj` (a Wavefront mesh + `.mtl`). Mirrors [`open`] so Save needs no separate
+/// "export" step.
+pub fn save(path: impl AsRef<Path>, chunk: &Chunk, palette: &Palette) -> Result<(), Box<dyn Error>> {
+    let path = path.as_ref();
+    match path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
+        Some("vox") => save_vox(path, chunk, palette),
+        Some("obj") => export_obj(path, chunk, palette),
+        other => Err(format!("unsupported file type: {} (save as .vox or .obj)", other.unwrap_or("(none)")).into()),
+    }
+}
+
 /// Save the chunk and palette losslessly to a MagicaVoxel `.vox` file. This is
 /// the native project format: it stores the voxel grid and real color palette,
 /// round-trips through [`load_vox`], and opens in MagicaVoxel and most engines.

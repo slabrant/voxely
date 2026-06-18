@@ -22,7 +22,7 @@ pub mod render;
     println!("Change Color: 1-9");
     println!("Undo: Ctrl+Z  |  Redo: Ctrl+Y or Ctrl+Shift+Z");
     println!("Save: Ctrl+S  |  Save As: Ctrl+Shift+S  |  Open: Ctrl+O");
-    println!("Export .obj: Ctrl+E");
+    println!("(Save As a .vox project or an .obj mesh; Open a .vox or .obj)");
     println!("--------------------------");
 
     let event_loop = EventLoop::new().unwrap();
