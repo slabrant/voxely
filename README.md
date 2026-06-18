@@ -14,6 +14,9 @@ an [egui](https://www.egui.rs/) side panel.
 - Export to Wavefront `.obj` (+ `.mtl`) via a native save dialog — flat-shaded,
   1 m blocks, origin at the model's bottom-center, with hidden faces culled and
   coplanar same-color faces merged (greedy meshing) to keep the triangle count low
+- Import a Voxely-exported `.obj` (with its `.mtl`) back into voxels, refilling
+  any interior that face-culling removed on export
+- Open files from the OS ("Open With…") or by dragging them onto the window
 
 ## Requirements
 

@@ -36,6 +36,12 @@ pub mod render;
     let mut state = state::State::new(Arc::clone(&window)).await;
     let window_id = window.id();
 
+    // Opening a file via the OS ("Open With…", or a path passed on the command
+    // line) loads it on startup. Anything beyond the first argument is ignored.
+    if let Some(arg) = std::env::args_os().nth(1) {
+        state.load_path(std::path::Path::new(&arg));
+    }
+
     event_loop.run(move |event, elwt| {
         match event {
             Event::WindowEvent {

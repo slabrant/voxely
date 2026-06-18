@@ -48,9 +48,14 @@ jobs:
           [Desktop Entry]
           Type=Application
           Name=Voxely
-          Exec=voxely
+          # %f passes the path of the file chosen via "Open With…" / a double-click
+          # as the first argument; without it the app launches but never opens it.
+          Exec=voxely %f
           Icon=voxely
           Categories=Graphics;3DGraphics;
+          # Advertise the formats Voxely opens so it shows up in file managers'
+          # "Open With" list for .vox and .obj.
+          MimeType=model/obj;application/x-voxel;
           Terminal=false
           EOF
           cat > "$APPDIR/AppRun" <<'EOF'

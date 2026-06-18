@@ -629,6 +629,13 @@ impl State {
     }
 
     pub fn input(&mut self, event: &WindowEvent) -> bool {
+        // A file dropped onto the window opens/imports it. Handle this before
+        // egui so the drop always loads the model regardless of cursor position.
+        if let WindowEvent::DroppedFile(path) = event {
+            self.load_path(path);
+            return true;
+        }
+
         // Tab cycles tools (Shift+Tab reverse). Intercept it *before* egui,
         // which would otherwise consume Tab to move focus between panel
         // widgets. While egui is capturing the keyboard (e.g. editing a
@@ -1942,23 +1949,38 @@ impl State {
         }
     }
 
-    /// Open a native `.vox` model (voxel grid + palette) via a file picker.
+    /// Open a `.vox` model or import a Voxely-exported `.obj` via a file picker.
     fn open_file(&mut self) {
         let Some(path) = rfd::FileDialog::new()
-            .set_title("Open .vox")
+            .set_title("Open model")
+            .add_filter("Voxely models", &["vox", "obj"])
             .add_filter("MagicaVoxel", &["vox"])
+            .add_filter("Wavefront OBJ", &["obj"])
             .pick_file()
         else {
             return; // user cancelled
         };
-        match crate::io::open(&path) {
+        self.load_path(&path);
+    }
+
+    /// Load a model from `path` into the editor, replacing the current scene.
+    /// Shared by the file picker, the OS "Open With" command-line argument, and
+    /// drag-and-drop. Only the native `.vox` is adopted as the save target; an
+    /// imported `.obj` leaves the path unset so the next Save prompts for a
+    /// `.vox` rather than silently overwriting the mesh.
+    pub fn load_path(&mut self, path: &std::path::Path) {
+        match crate::io::open(path) {
             Ok(project) => {
                 self.chunk = project.chunk;
                 self.palette = project.palette;
                 self.history.clear();
                 self.sync_to_chunk();
                 println!("Opened {}", path.display());
-                self.current_path = Some(path.clone());
+                let is_vox = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("vox"));
+                self.current_path = is_vox.then(|| path.to_path_buf());
             }
             Err(e) => eprintln!("Open failed: {e}"),
         }

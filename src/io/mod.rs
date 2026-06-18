@@ -11,14 +11,16 @@ pub struct Project {
     pub palette: Palette,
 }
 
-/// Open a model file. Only the native, lossless `.vox` format (voxel grid +
-/// palette) can be opened; `.obj` is export-only.
+/// Open a model file. The native, lossless `.vox` format (voxel grid + palette)
+/// opens directly; an `.obj` is imported back into voxels, but only when it was
+/// produced by [`export_obj`] (and its companion `.mtl` sits alongside it).
 pub fn open(path: impl AsRef<Path>) -> Result<Project, Box<dyn Error>> {
     let path = path.as_ref();
     match path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
         Some("vox") => load_vox(path),
+        Some("obj") => load_obj(path),
         other => Err(format!(
-            "unsupported file type: {} (only .vox can be opened)",
+            "unsupported file type: {} (only .vox and .obj can be opened)",
             other.unwrap_or("(none)")
         )
         .into()),
@@ -369,6 +371,337 @@ pub fn export_obj(path: impl AsRef<Path>, chunk: &Chunk, palette: &Palette) -> R
     Ok(())
 }
 
+/// Import a Wavefront `.obj` produced by [`export_obj`] back into voxels.
+///
+/// The export keeps only the *surface* of the model: every quad is an
+/// axis-aligned, greedy-merged rectangle of one color, with an explicit flat
+/// normal telling us which way the face points. From each face we know exactly
+/// which voxel cell sits behind it (the one on the solid side of the normal) and
+/// its color, so the visible "crust" is reconstructed directly. Interior voxels
+/// were culled on export, so any empty cell that the surface fully seals off
+/// (unreachable from outside the bounding box) is filled back in as solid — a
+/// solid block round-trips as a solid block rather than a hollow shell.
+///
+/// The format is strict: this only accepts the structure Voxely writes (quads
+/// with `v//vn` faces, a `mtllib` whose `.mtl` sits alongside, and `usemtl`
+/// materials carrying `Kd`). Anything else is reported as an error.
+pub fn load_obj(path: impl AsRef<Path>) -> Result<Project, Box<dyn Error>> {
+    let path = path.as_ref();
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+
+    // Colors keyed by material name, loaded from the `.mtl` named by `mtllib`.
+    // Resolved lazily on the first `usemtl` so a file with no faces is fine.
+    let mut mtl_colors: Option<std::collections::HashMap<String, [u8; 4]>> = None;
+
+    let mut vertices: Vec<[f32; 3]> = Vec::new();
+    let mut normals: Vec<[i32; 3]> = Vec::new();
+
+    // A reconstructed face: four 1-based vertex indices, a 1-based normal index,
+    // and the palette color index of its material.
+    struct Face {
+        verts: [usize; 4],
+        normal: usize,
+        color: u8,
+    }
+    let mut faces: Vec<Face> = Vec::new();
+
+    // Materials are renamed to mtl1, mtl2, ... on export with no original index
+    // preserved, so we hand out fresh palette slots 1.. in first-use order and
+    // remember the mapping for the rest of the file.
+    let mut palette = Palette::default();
+    let mut mat_index: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
+    let mut next_color: u8 = 1;
+    let mut current_color: Option<u8> = None;
+
+    for (lineno, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut tok = line.split_whitespace();
+        let Some(kind) = tok.next() else { continue };
+        let err = |msg: &str| -> Box<dyn Error> {
+            format!("{}:{}: {msg}", path.display(), lineno + 1).into()
+        };
+        match kind {
+            "mtllib" => {
+                let name = tok.next().ok_or_else(|| err("mtllib is missing a filename"))?;
+                let mtl_path = path.with_file_name(name);
+                let mtl_text = std::fs::read_to_string(&mtl_path).map_err(|e| {
+                    err(&format!("could not read companion material file {}: {e}", mtl_path.display()))
+                })?;
+                mtl_colors = Some(parse_mtl(&mtl_text)?);
+            }
+            "v" => {
+                let c = parse_vec3(&mut tok).ok_or_else(|| err("vertex needs three numbers"))?;
+                vertices.push(c);
+            }
+            "vn" => {
+                let c = parse_vec3(&mut tok).ok_or_else(|| err("normal needs three numbers"))?;
+                // Export only ever writes the six unit axis normals; round so a
+                // value like 1.0 lands cleanly on an integer axis direction.
+                normals.push([c[0].round() as i32, c[1].round() as i32, c[2].round() as i32]);
+            }
+            "usemtl" => {
+                let name = tok.next().ok_or_else(|| err("usemtl is missing a name"))?;
+                let color = match mat_index.get(name) {
+                    Some(&c) => c,
+                    None => {
+                        let colors = mtl_colors
+                            .as_ref()
+                            .ok_or_else(|| err("usemtl appears before any mtllib"))?;
+                        let rgba = *colors
+                            .get(name)
+                            .ok_or_else(|| err(&format!("material '{name}' is not defined in the .mtl")))?;
+                        if next_color == u8::MAX {
+                            return Err(err("too many materials (max 255)"));
+                        }
+                        let slot = next_color;
+                        palette.colors[slot as usize] = rgba;
+                        mat_index.insert(name.to_string(), slot);
+                        next_color += 1;
+                        slot
+                    }
+                };
+                current_color = Some(color);
+            }
+            "f" => {
+                let color = current_color.ok_or_else(|| err("face appears before any usemtl"))?;
+                let mut verts = [0usize; 4];
+                let mut normal = 0usize;
+                let mut count = 0;
+                for vtok in tok {
+                    if count == 4 {
+                        return Err(err("faces must be quads (Voxely exports four-sided faces)"));
+                    }
+                    // Each reference is `v//vn`; the middle texture slot is empty.
+                    let mut parts = vtok.split('/');
+                    let vi: usize = parts
+                        .next()
+                        .and_then(|s| s.parse().ok())
+                        .ok_or_else(|| err("face vertex index is malformed"))?;
+                    let _ = parts.next();
+                    let ni: usize = parts
+                        .next()
+                        .and_then(|s| s.parse().ok())
+                        .ok_or_else(|| err("faces must reference a normal (v//vn)"))?;
+                    if vi == 0 || vi > vertices.len() {
+                        return Err(err("face references an out-of-range vertex"));
+                    }
+                    if ni == 0 || ni > normals.len() {
+                        return Err(err("face references an out-of-range normal"));
+                    }
+                    verts[count] = vi;
+                    normal = ni;
+                    count += 1;
+                }
+                if count != 4 {
+                    return Err(err("faces must be quads (Voxely exports four-sided faces)"));
+                }
+                faces.push(Face { verts, normal, color });
+            }
+            // Texture coords and smoothing groups are never written by Voxely;
+            // ignore the handful of harmless keywords rather than erroring.
+            "vt" | "s" | "o" | "g" => {}
+            other => return Err(err(&format!("unexpected '{other}' directive"))),
+        }
+    }
+
+    // An empty export (no geometry) opens as a fresh default canvas.
+    if faces.is_empty() {
+        return Ok(Project { chunk: Chunk::new(), palette });
+    }
+
+    // Vertices are `grid_corner - origin` with a constant per-axis offset and
+    // exactly one unit between cells, so shifting by the per-axis minimum and
+    // rounding recovers non-negative integer grid-corner coordinates.
+    let mut vmin = [f32::INFINITY; 3];
+    for v in &vertices {
+        for a in 0..3 {
+            vmin[a] = vmin[a].min(v[a]);
+        }
+    }
+    let grid = |vi: usize| -> [i32; 3] {
+        let v = vertices[vi - 1];
+        [
+            (v[0] - vmin[0]).round() as i32,
+            (v[1] - vmin[1]).round() as i32,
+            (v[2] - vmin[2]).round() as i32,
+        ]
+    };
+
+    // The largest corner index along an axis equals the cell count there.
+    let mut dims = [0i32; 3];
+    for v in 1..=vertices.len() {
+        let g = grid(v);
+        for a in 0..3 {
+            dims[a] = dims[a].max(g[a]);
+        }
+    }
+    let dims = [dims[0].max(1) as usize, dims[1].max(1) as usize, dims[2].max(1) as usize];
+    for (axis, &d) in ["X", "Y", "Z"].iter().zip(&dims) {
+        if d > crate::core::chunk::MAX_CHUNK_SIZE {
+            return Err(format!(
+                "model is {d} voxels on {axis} (max {})",
+                crate::core::chunk::MAX_CHUNK_SIZE
+            )
+            .into());
+        }
+    }
+
+    let mut chunk = Chunk::with_size(dims[0], dims[1], dims[2]);
+
+    // Reconstruct the crust: each face's normal points away from the solid, so
+    // the solid cell sits at the face plane for a negative normal and one cell
+    // back for a positive one.
+    for f in &faces {
+        let n = normals[f.normal - 1];
+        let na = (0..3).find(|&a| n[a] != 0).ok_or("a face normal is zero")?;
+        let s = n[na];
+        let others: Vec<usize> = (0..3).filter(|&a| a != na).collect();
+        let (ua, va) = (others[0], others[1]);
+
+        let corners: Vec<[i32; 3]> = f.verts.iter().map(|&vi| grid(vi)).collect();
+        let p = corners[0][na];
+        let u0 = corners.iter().map(|c| c[ua]).min().unwrap();
+        let u1 = corners.iter().map(|c| c[ua]).max().unwrap();
+        let v0 = corners.iter().map(|c| c[va]).min().unwrap();
+        let v1 = corners.iter().map(|c| c[va]).max().unwrap();
+        let cell_na = if s < 0 { p } else { p - 1 };
+        if cell_na < 0 {
+            continue;
+        }
+        for ui in u0..u1 {
+            for vj in v0..v1 {
+                let mut c = [0usize; 3];
+                c[na] = cell_na as usize;
+                c[ua] = ui as usize;
+                c[va] = vj as usize;
+                chunk.set(c[0], c[1], c[2], Voxel { color_index: f.color });
+            }
+        }
+    }
+
+    fill_enclosed_interior(&mut chunk);
+
+    Ok(Project { chunk, palette })
+}
+
+/// Parse a Voxely-exported `.mtl` into `name -> RGBA`. Only `newmtl`/`Kd` are
+/// read; `Kd` is sRGB 0..1 (alpha is not exported, so it defaults to opaque).
+fn parse_mtl(text: &str) -> Result<std::collections::HashMap<String, [u8; 4]>, Box<dyn Error>> {
+    let mut colors = std::collections::HashMap::new();
+    let mut current: Option<String> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut tok = line.split_whitespace();
+        match tok.next() {
+            Some("newmtl") => {
+                let name = tok.next().ok_or("newmtl is missing a name")?;
+                current = Some(name.to_string());
+                colors.entry(name.to_string()).or_insert([255, 255, 255, 255]);
+            }
+            Some("Kd") => {
+                let name = current.as_ref().ok_or("Kd appears before any newmtl")?;
+                let rgb = parse_vec3(&mut tok).ok_or("Kd needs three numbers")?;
+                let to_byte = |c: f32| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+                colors.insert(name.clone(), [to_byte(rgb[0]), to_byte(rgb[1]), to_byte(rgb[2]), 255]);
+            }
+            _ => {}
+        }
+    }
+    Ok(colors)
+}
+
+/// Parse the next three whitespace-separated floats from `tok`.
+fn parse_vec3<'a>(tok: &mut impl Iterator<Item = &'a str>) -> Option<[f32; 3]> {
+    let x = tok.next()?.parse().ok()?;
+    let y = tok.next()?.parse().ok()?;
+    let z = tok.next()?.parse().ok()?;
+    Some([x, y, z])
+}
+
+/// Flood empty space inward from the bounding-box border (6-connected) and mark
+/// everything it can't reach as solid. The reconstructed crust is a closed shell
+/// around the model's hidden core, so any empty cell the flood never touches was
+/// interior and is filled with the model's most common surface color.
+fn fill_enclosed_interior(chunk: &mut Chunk) {
+    let (w, h, d) = (chunk.width, chunk.height, chunk.depth);
+    let idx = |x: usize, y: usize, z: usize| x + y * w + z * w * h;
+
+    // Snapshot solidity and tally crust colors in one pass. The most common
+    // surface color fills interior voxels (invisible anyway) so they blend in if
+    // ever exposed by later editing.
+    let mut solid = vec![false; w * h * d];
+    let mut counts = [0u32; 256];
+    for x in 0..w {
+        for y in 0..h {
+            for z in 0..d {
+                if let Some(v) = chunk.get(x, y, z).filter(|v| !v.is_empty()) {
+                    solid[idx(x, y, z)] = true;
+                    counts[v.color_index as usize] += 1;
+                }
+            }
+        }
+    }
+    let fill_color = counts
+        .iter()
+        .enumerate()
+        .skip(1)
+        .max_by_key(|&(_, &n)| n)
+        .map(|(i, _)| i as u8)
+        .unwrap_or(1);
+
+    // Flood empty air inward from the six bounding faces (6-connected). Whatever
+    // it can't reach is sealed interior.
+    let mut outside = vec![false; w * h * d];
+    let mut stack: Vec<(usize, usize, usize)> = Vec::new();
+    let on_border = |x: usize, y: usize, z: usize| {
+        x == 0 || y == 0 || z == 0 || x == w - 1 || y == h - 1 || z == d - 1
+    };
+    for x in 0..w {
+        for y in 0..h {
+            for z in 0..d {
+                if on_border(x, y, z) && !solid[idx(x, y, z)] && !outside[idx(x, y, z)] {
+                    outside[idx(x, y, z)] = true;
+                    stack.push((x, y, z));
+                }
+            }
+        }
+    }
+    while let Some((x, y, z)) = stack.pop() {
+        let neighbors = [
+            (x.wrapping_sub(1), y, z, x > 0),
+            (x + 1, y, z, x + 1 < w),
+            (x, y.wrapping_sub(1), z, y > 0),
+            (x, y + 1, z, y + 1 < h),
+            (x, y, z.wrapping_sub(1), z > 0),
+            (x, y, z + 1, z + 1 < d),
+        ];
+        for (nx, ny, nz, in_bounds) in neighbors {
+            if in_bounds && !solid[idx(nx, ny, nz)] && !outside[idx(nx, ny, nz)] {
+                outside[idx(nx, ny, nz)] = true;
+                stack.push((nx, ny, nz));
+            }
+        }
+    }
+
+    // Empty and never reached from outside => sealed interior => fill it.
+    for x in 0..w {
+        for y in 0..h {
+            for z in 0..d {
+                if !solid[idx(x, y, z)] && !outside[idx(x, y, z)] {
+                    chunk.set(x, y, z, Voxel { color_index: fill_color });
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,5 +816,90 @@ mod tests {
         assert_eq!(loaded.palette.colors[7], palette.colors[7]);
         assert_eq!(loaded.palette.colors[3], palette.colors[3]);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn export_then_import_obj_round_trips_shape_and_color() {
+        // An L of two differently-colored voxels: shape, relative position, and
+        // each voxel's color must survive an export/import round-trip.
+        let mut chunk = Chunk::with_size(8, 8, 8);
+        chunk.set(2, 0, 3, Voxel { color_index: 1 }); // red
+        chunk.set(3, 0, 3, Voxel { color_index: 3 }); // blue
+        let palette = Palette::default();
+
+        let dir = std::env::temp_dir();
+        let obj_path = dir.join("voxely_test_import.obj");
+        export_obj(&obj_path, &chunk, &palette).expect("export should succeed");
+
+        let project = load_obj(&obj_path).expect("import should succeed");
+        let imported = &project.chunk;
+
+        // Exactly two solid voxels, side by side along X on the bottom layer.
+        let mut solids = Vec::new();
+        for x in 0..imported.width {
+            for y in 0..imported.height {
+                for z in 0..imported.depth {
+                    if imported.get(x, y, z).is_some_and(|v| !v.is_empty()) {
+                        solids.push((x, y, z, imported.get(x, y, z).unwrap().color_index));
+                    }
+                }
+            }
+        }
+        assert_eq!(solids.len(), 2, "two voxels survive the round-trip");
+        solids.sort();
+        let (lx, ly, lz, lc) = solids[0];
+        let (rx, ry, rz, rc) = solids[1];
+        assert_eq!((ry, rz), (ly, lz), "both rest on the same layer/row");
+        assert_eq!(rx, lx + 1, "the two voxels are adjacent along X");
+
+        // Colors come back via the .mtl: the imported palette slots match the
+        // original red and blue, even though indices were renumbered on export.
+        assert_eq!(project.palette.colors[lc as usize], palette.colors[1], "left stays red");
+        assert_eq!(project.palette.colors[rc as usize], palette.colors[3], "right stays blue");
+
+        let _ = std::fs::remove_file(&obj_path);
+        let _ = std::fs::remove_file(obj_path.with_extension("mtl"));
+    }
+
+    #[test]
+    fn import_obj_fills_sealed_interior_solid() {
+        // A solid 3x3x3 block exports as just its surface (the center cell has no
+        // exposed face). Import must flood-fill that sealed cell back to solid.
+        let mut chunk = Chunk::with_size(8, 8, 8);
+        for x in 0..3 {
+            for y in 0..3 {
+                for z in 0..3 {
+                    chunk.set(x, y, z, Voxel { color_index: 2 });
+                }
+            }
+        }
+        let dir = std::env::temp_dir();
+        let obj_path = dir.join("voxely_test_fill.obj");
+        export_obj(&obj_path, &chunk, &Palette::default()).expect("export should succeed");
+
+        let project = load_obj(&obj_path).expect("import should succeed");
+        let n = (0..project.chunk.width)
+            .flat_map(|x| (0..project.chunk.height).flat_map(move |y| (0..project.chunk.depth).map(move |z| (x, y, z))))
+            .filter(|&(x, y, z)| project.chunk.get(x, y, z).is_some_and(|v| !v.is_empty()))
+            .count();
+        assert_eq!(n, 27, "the sealed center voxel is filled back in");
+
+        let _ = std::fs::remove_file(&obj_path);
+        let _ = std::fs::remove_file(obj_path.with_extension("mtl"));
+    }
+
+    #[test]
+    fn import_obj_errors_without_mtl() {
+        // Export, then delete the companion .mtl: import must fail rather than
+        // silently dropping colors.
+        let mut chunk = Chunk::new();
+        chunk.set(1, 1, 1, Voxel { color_index: 1 });
+        let dir = std::env::temp_dir();
+        let obj_path = dir.join("voxely_test_nomtl.obj");
+        export_obj(&obj_path, &chunk, &Palette::default()).expect("export should succeed");
+        let _ = std::fs::remove_file(obj_path.with_extension("mtl"));
+
+        assert!(load_obj(&obj_path).is_err(), "missing .mtl is an error");
+        let _ = std::fs::remove_file(&obj_path);
     }
 }
