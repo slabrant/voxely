@@ -9,10 +9,9 @@ use winit::{
     window::Window,
 };
 
-/// Default file name suggested in the "Save" dialog. `.vox` is the native,
-/// lossless project format; choosing an `.obj` name in the dialog exports a mesh
-/// instead (see `crate::io::save`).
-const VOX_PATH: &str = "model.vox";
+/// Default file name suggested in the "Save" dialog. Models save as a Wavefront
+/// `.obj` mesh (plus a companion `.mtl`); see `crate::io::save`.
+const OBJ_PATH: &str = "model.obj";
 
 pub struct State {
     surface: wgpu::Surface<'static>,
@@ -79,7 +78,7 @@ pub struct State {
     tool: Tool,
     /// Canvas dimensions edited in the UI, applied on "Resize".
     pending_size: [usize; 3],
-    /// Path of the current `.vox` project, if it has been saved/opened. `Save`
+    /// Path of the current `.obj` model, if it has been saved/opened. `Save`
     /// writes here silently; `Save As` (or saving when this is `None`) prompts.
     current_path: Option<std::path::PathBuf>,
 }
@@ -1917,20 +1916,18 @@ impl State {
         }
     }
 
-    /// Save the model via a "save as" dialog. The chosen extension picks the
-    /// format — `.vox` for a native project or `.obj` for a Wavefront mesh — so
-    /// export lives here rather than as a separate command. The path is
-    /// remembered for subsequent plain `Save`s.
+    /// Save the model via a "save as" dialog as a Wavefront `.obj` mesh (plus a
+    /// companion `.mtl`), so export lives here rather than as a separate command.
+    /// The path is remembered for subsequent plain `Save`s.
     fn save_project_as(&mut self) {
         let suggested = self
             .current_path
             .as_ref()
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
-            .unwrap_or(VOX_PATH);
+            .unwrap_or(OBJ_PATH);
         let Some(path) = rfd::FileDialog::new()
             .set_title("Save as")
-            .add_filter("MagicaVoxel", &["vox"])
             .add_filter("Wavefront OBJ", &["obj"])
             .set_file_name(suggested)
             .save_file()
@@ -1952,12 +1949,10 @@ impl State {
         }
     }
 
-    /// Open a `.vox` model or import a Voxely-exported `.obj` via a file picker.
+    /// Import a Voxely-exported `.obj` via a file picker.
     fn open_file(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .set_title("Open model")
-            .add_filter("Voxely models", &["vox", "obj"])
-            .add_filter("MagicaVoxel", &["vox"])
             .add_filter("Wavefront OBJ", &["obj"])
             .pick_file()
         else {
@@ -1968,8 +1963,8 @@ impl State {
 
     /// Load a model from `path` into the editor, replacing the current scene.
     /// Shared by the file picker, the OS "Open With" command-line argument, and
-    /// drag-and-drop. Both openable formats (`.vox` and `.obj`) are also save
-    /// targets, so the path is adopted for subsequent plain `Save`s.
+    /// drag-and-drop. The openable format (`.obj`) is also a save
+    /// target, so the path is adopted for subsequent plain `Save`s.
     pub fn load_path(&mut self, path: &std::path::Path) {
         match crate::io::open(path) {
             Ok(project) => {

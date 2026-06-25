@@ -11,141 +11,28 @@ pub struct Project {
     pub palette: Palette,
 }
 
-/// Open a model file. The native, lossless `.vox` format (voxel grid + palette)
-/// opens directly; an `.obj` is imported back into voxels, but only when it was
-/// produced by [`export_obj`] (and its companion `.mtl` sits alongside it).
+/// Open a model file. Only `.obj` is supported, and only when it was produced by
+/// [`export_obj`] (its companion `.mtl` must sit alongside it).
 pub fn open(path: impl AsRef<Path>) -> Result<Project, Box<dyn Error>> {
     let path = path.as_ref();
     match path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
-        Some("vox") => load_vox(path),
         Some("obj") => load_obj(path),
         other => Err(format!(
-            "unsupported file type: {} (only .vox and .obj can be opened)",
+            "unsupported file type: {} (only .obj can be opened)",
             other.unwrap_or("(none)")
         )
         .into()),
     }
 }
 
-/// Save a model, choosing the writer by extension: `.vox` (native, lossless) or
-/// `.obj` (a Wavefront mesh + `.mtl`). Mirrors [`open`] so Save needs no separate
-/// "export" step.
+/// Save a model as a Wavefront `.obj` mesh (plus a companion `.mtl`). Mirrors
+/// [`open`] so Save needs no separate "export" step.
 pub fn save(path: impl AsRef<Path>, chunk: &Chunk, palette: &Palette) -> Result<(), Box<dyn Error>> {
     let path = path.as_ref();
     match path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
-        Some("vox") => save_vox(path, chunk, palette),
         Some("obj") => export_obj(path, chunk, palette),
-        other => Err(format!("unsupported file type: {} (save as .vox or .obj)", other.unwrap_or("(none)")).into()),
+        other => Err(format!("unsupported file type: {} (save as .obj)", other.unwrap_or("(none)")).into()),
     }
-}
-
-/// Save the chunk and palette losslessly to a MagicaVoxel `.vox` file. This is
-/// the native project format: it stores the voxel grid and real color palette,
-/// round-trips through [`load_vox`], and opens in MagicaVoxel and most engines.
-///
-/// We are Y-up while `.vox` is Z-up, so engine `(x, y, z)` is written as vox
-/// `(x, z, y)` — the inverse of the swap [`load_vox`] applies on the way in.
-pub fn save_vox(path: impl AsRef<Path>, chunk: &Chunk, palette: &Palette) -> Result<(), Box<dyn Error>> {
-    // `.vox` coordinates are single bytes, so each dimension must fit in 0..=256
-    // (indices 0..=255). The editor caps dimensions well below this already.
-    if chunk.width > 256 || chunk.height > 256 || chunk.depth > 256 {
-        return Err("chunk is too large to save as .vox (max 256 per axis)".into());
-    }
-
-    let mut voxels = Vec::new();
-    for x in 0..chunk.width {
-        for y in 0..chunk.height {
-            for z in 0..chunk.depth {
-                if let Some(v) = chunk.get(x, y, z) {
-                    if !v.is_empty() {
-                        // engine (x, y, z) Y-up -> vox (x, z, y) Z-up; color
-                        // index 1..=255 becomes vox 0-based `i` = index - 1.
-                        voxels.push(dot_vox::Voxel {
-                            x: x as u8,
-                            y: z as u8,
-                            z: y as u8,
-                            i: v.color_index - 1,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    // 256-color RGBA table written 1:1 with our palette. `load_vox` (mirroring
-    // dot_vox's default index map, which maps in-memory index i -> slot i + 1)
-    // reads our color index C straight back from `data.palette[C]`, so writing
-    // slot-for-slot makes the palette round-trip exactly.
-    let pal = (0..256)
-        .map(|k| {
-            let c = palette.colors.get(k).copied().unwrap_or([0, 0, 0, 255]);
-            dot_vox::Color { r: c[0], g: c[1], b: c[2], a: c[3] }
-        })
-        .collect();
-
-    let data = dot_vox::DotVoxData {
-        version: 150,
-        index_map: Vec::new(),
-        models: vec![dot_vox::Model {
-            size: dot_vox::Size {
-                x: chunk.width as u32,
-                y: chunk.depth as u32,
-                z: chunk.height as u32,
-            },
-            voxels,
-        }],
-        palette: pal,
-        materials: Vec::new(),
-        scenes: Vec::new(),
-        layers: Vec::new(),
-    };
-
-    let mut file = std::fs::File::create(path)?;
-    data.write_vox(&mut file)?;
-    Ok(())
-}
-
-/// Load a MagicaVoxel `.vox` file, bringing along its real color palette.
-/// MagicaVoxel is Z-up, so Y and Z are swapped to match our Y-up engine. Color
-/// indices are shifted by one so index 0 stays "empty".
-pub fn load_vox(path: impl AsRef<Path>) -> Result<Project, Box<dyn Error>> {
-    let path = path.as_ref();
-    let data = dot_vox::load(path.to_str().ok_or("non-UTF-8 path")?)
-        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-    let model = data.models.first().ok_or("the .vox file has no models")?;
-
-    let mut palette = Palette::default();
-    // dot_vox stores in-memory indices 0..=254; remap through index_map (if
-    // present) and shift into slots 1..=255 to keep slot 0 reserved for empty.
-    for i in 0..255usize {
-        let src = data.index_map.get(i).map(|&m| m as usize).unwrap_or(i);
-        if let Some(c) = data.palette.get(src) {
-            palette.colors[i + 1] = [c.r, c.g, c.b, c.a];
-        }
-    }
-
-    // Size the chunk to the model so nothing is silently clipped.
-    let mut chunk = Chunk::with_size(
-        (model.size.x as usize).max(1),
-        (model.size.z as usize).max(1),
-        (model.size.y as usize).max(1),
-    );
-    let mut dropped = 0usize;
-    for v in &model.voxels {
-        let color_index = v.i.saturating_add(1);
-        // (x, y, z) MagicaVoxel -> (x, z, y) engine (Z-up to Y-up).
-        if !chunk.set(v.x as usize, v.z as usize, v.y as usize, Voxel { color_index }) {
-            dropped += 1;
-        }
-    }
-    if dropped > 0 {
-        log::warn!(
-            "{dropped} voxels were outside the {}x{}x{} chunk and were dropped on load",
-            chunk.width, chunk.height, chunk.depth
-        );
-    }
-
-    Ok(Project { chunk, palette })
 }
 
 /// Export the chunk to a Wavefront `.obj` file (plus a companion `.mtl` with one
@@ -809,25 +696,6 @@ mod tests {
 
         let _ = std::fs::remove_file(&obj_path);
         let _ = std::fs::remove_file(dir.join("voxely_test_origin.mtl"));
-    }
-
-    #[test]
-    fn save_then_load_vox_round_trips() {
-        let mut chunk = Chunk::with_size(8, 8, 8);
-        chunk.set(1, 2, 3, Voxel { color_index: 7 });
-        chunk.set(5, 0, 6, Voxel { color_index: 3 });
-        let palette = Palette::default();
-
-        let path = std::env::temp_dir().join("voxely_test_project.vox");
-        save_vox(&path, &chunk, &palette).expect("save should succeed");
-        let loaded = load_vox(&path).expect("load should succeed");
-
-        assert_eq!(loaded.chunk.get(1, 2, 3).unwrap().color_index, 7);
-        assert_eq!(loaded.chunk.get(5, 0, 6).unwrap().color_index, 3);
-        // The palette colors for the used indices survive the round-trip.
-        assert_eq!(loaded.palette.colors[7], palette.colors[7]);
-        assert_eq!(loaded.palette.colors[3], palette.colors[3]);
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -54,8 +54,8 @@ jobs:
           Icon=voxely
           Categories=Graphics;3DGraphics;
           # Advertise the formats Voxely opens so it shows up in file managers'
-          # "Open With" list for .vox and .obj.
-          MimeType=model/obj;application/x-voxel;
+          # "Open With" list for .obj.
+          MimeType=model/obj;
           Terminal=false
           EOF
           cat > "$APPDIR/AppRun" <<'EOF'
