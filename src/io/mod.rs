@@ -325,7 +325,12 @@ pub fn load_obj(path: impl AsRef<Path>) -> Result<Project, Box<dyn Error>> {
         };
         match kind {
             "mtllib" => {
-                let name = tok.next().ok_or_else(|| err("mtllib is missing a filename"))?;
+                // The filename can contain spaces (e.g. "data diel.mtl"), so take
+                // the whole remainder of the line rather than a single token.
+                let name = line["mtllib".len()..].trim();
+                if name.is_empty() {
+                    return Err(err("mtllib is missing a filename"));
+                }
                 let mtl_path = path.with_file_name(name);
                 let mtl_text = std::fs::read_to_string(&mtl_path).map_err(|e| {
                     err(&format!("could not read companion material file {}: {e}", mtl_path.display()))

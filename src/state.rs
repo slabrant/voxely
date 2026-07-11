@@ -81,6 +81,12 @@ pub struct State {
     /// Path of the current `.obj` model, if it has been saved/opened. `Save`
     /// writes here silently; `Save As` (or saving when this is `None`) prompts.
     current_path: Option<std::path::PathBuf>,
+    /// Transient status banner (message, is-error, shown-at). Set by file
+    /// open/save so the user sees the outcome in-app; auto-dismisses.
+    status: Option<(String, bool, std::time::Instant)>,
+    /// Directory of the last file opened or saved, so the next file dialog
+    /// starts there instead of the home folder.
+    last_dir: Option<std::path::PathBuf>,
 }
 
 /// The active editing tool, chosen from the UI or with a hotkey.
@@ -280,7 +286,7 @@ impl State {
             aspect: config.width as f32 / config.height as f32,
             fovy: 45.0,
             znear: 0.1,
-            zfar: 100.0,
+            zfar: 2000.0,
         };
 
         let mut camera_uniform = CameraUniform::new();
@@ -612,7 +618,22 @@ impl State {
             tool: Tool::Build,
             pending_size: [chunk_w, chunk_h, chunk_d],
             current_path: None,
+            status: None,
+            last_dir: None,
         }
+    }
+
+    /// Remember `path`'s parent directory as the starting point for the next
+    /// file dialog.
+    fn remember_dir(&mut self, path: &std::path::Path) {
+        if let Some(dir) = path.parent() {
+            self.last_dir = Some(dir.to_path_buf());
+        }
+    }
+
+    /// Show a transient status banner (green for success, red for error).
+    fn set_status(&mut self, msg: impl Into<String>, is_error: bool) {
+        self.status = Some((msg.into(), is_error, std::time::Instant::now()));
     }
 
 
@@ -812,6 +833,7 @@ impl State {
                         }
                         KeyCode::KeyS if ctrl && self.modifiers.shift_key() && !*repeat => { self.save_project_as(); return true; }
                         KeyCode::KeyS if ctrl && !*repeat => { self.save_project(); return true; }
+                        KeyCode::KeyN if ctrl && !*repeat => { self.new_project(); return true; }
                         KeyCode::KeyO if ctrl && !*repeat => { self.open_file(); return true; }
                         // One undo/redo per press: the `!*repeat` guard ignores
                         // the OS key-repeat stream while the key is held. The
@@ -1926,12 +1948,14 @@ impl State {
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
             .unwrap_or(OBJ_PATH);
-        let Some(path) = rfd::FileDialog::new()
+        let mut dialog = rfd::FileDialog::new()
             .set_title("Save as")
             .add_filter("Wavefront OBJ", &["obj"])
-            .set_file_name(suggested)
-            .save_file()
-        else {
+            .set_file_name(suggested);
+        if let Some(dir) = &self.last_dir {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(path) = dialog.save_file() else {
             return; // user cancelled
         };
         self.write_path(&path);
@@ -1944,18 +1968,25 @@ impl State {
             Ok(()) => {
                 println!("Saved {}", path.display());
                 self.current_path = Some(path.to_path_buf());
+                self.remember_dir(path);
+                self.set_status(format!("Saved {}", path.display()), false);
             }
-            Err(e) => eprintln!("Save failed: {e}"),
+            Err(e) => {
+                eprintln!("Save failed: {e}");
+                self.set_status(format!("Save failed: {e}"), true);
+            }
         }
     }
 
     /// Import a Voxely-exported `.obj` via a file picker.
     fn open_file(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
+        let mut dialog = rfd::FileDialog::new()
             .set_title("Open model")
-            .add_filter("Wavefront OBJ", &["obj"])
-            .pick_file()
-        else {
+            .add_filter("Wavefront OBJ", &["obj"]);
+        if let Some(dir) = &self.last_dir {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(path) = dialog.pick_file() else {
             return; // user cancelled
         };
         self.load_path(&path);
@@ -1974,9 +2005,24 @@ impl State {
                 self.sync_to_chunk();
                 println!("Opened {}", path.display());
                 self.current_path = Some(path.to_path_buf());
+                self.remember_dir(path);
+                self.set_status(format!("Opened {}", path.display()), false);
             }
-            Err(e) => eprintln!("Open failed: {e}"),
+            Err(e) => {
+                eprintln!("Open failed: {e}");
+                self.set_status(format!("Open failed: {e}"), true);
+            }
         }
+    }
+
+    /// Discard the current scene and start a fresh, empty model. Forgets the
+    /// current path so the next `Save` prompts for a new one.
+    fn new_project(&mut self) {
+        self.chunk = crate::core::Chunk::new();
+        self.palette = Palette::default();
+        self.history.clear();
+        self.sync_to_chunk();
+        self.current_path = None;
     }
 
     pub fn update(&mut self) {
@@ -2109,6 +2155,7 @@ impl State {
 
     fn build_ui(&mut self, ctx: &egui::Context) {
         self.build_menu_bar(ctx);
+        self.build_status_banner(ctx);
         egui::SidePanel::left("controls_panel")
             .resizable(false)
             .default_width(210.0)
@@ -2232,10 +2279,51 @@ impl State {
 
     /// The top menu bar: File (open/save), Edit (canvas extents), and Help
     /// (controls reference).
+    /// A transient banner at the bottom showing the last open/save outcome.
+    /// Green for success, red for errors; fades after a few seconds.
+    fn build_status_banner(&mut self, ctx: &egui::Context) {
+        const TTL: std::time::Duration = std::time::Duration::from_secs(6);
+        let Some((msg, is_error, shown_at)) = self.status.clone() else { return };
+        let elapsed = shown_at.elapsed();
+        if elapsed >= TTL {
+            self.status = None;
+            return;
+        }
+        // Keep animating so the banner disappears on time without needing input.
+        ctx.request_repaint_after(TTL - elapsed);
+
+        let (bg, fg) = if is_error {
+            (egui::Color32::from_rgb(120, 30, 30), egui::Color32::WHITE)
+        } else {
+            (egui::Color32::from_rgb(30, 90, 40), egui::Color32::WHITE)
+        };
+        let mut dismiss = false;
+        egui::TopBottomPanel::bottom("status_banner")
+            .frame(egui::Frame::none().fill(bg).inner_margin(egui::Margin::symmetric(8.0, 4.0)))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.colored_label(fg, if is_error { "⚠" } else { "✔" });
+                    ui.colored_label(fg, &msg);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("✖").clicked() {
+                            dismiss = true;
+                        }
+                    });
+                });
+            });
+        if dismiss {
+            self.status = None;
+        }
+    }
+
     fn build_menu_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
+                    if ui.button("New").clicked() {
+                        self.new_project();
+                        ui.close_menu();
+                    }
                     if ui.button("Open…").clicked() {
                         self.open_file();
                         ui.close_menu();

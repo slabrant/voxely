@@ -9,8 +9,13 @@ const ORBIT_SENSITIVITY: f32 = 0.005;
 /// Pan speed: fraction of the distance-to-target moved per pixel of middle-drag.
 /// Now angle-independent, so this is set to match the old ~45-degree feel.
 const PAN_SENSITIVITY: f32 = 0.0006;
-/// Zoom speed: distance moved toward the target per unit of scroll-wheel delta.
-const ZOOM_SENSITIVITY: f32 = 2.0;
+/// Zoom speed: fraction of the distance-to-target closed per unit of scroll
+/// delta. Proportional (multiplicative) so a notch feels the same whether the
+/// camera is right up against the model or far out, instead of crawling when
+/// zoomed way out.
+const ZOOM_SENSITIVITY: f32 = 0.1;
+/// Closest the eye may sit to the target, so zoom-in can't cross it.
+const MIN_ZOOM_DISTANCE: f32 = 0.5;
 
 pub struct Camera {
     pub eye: Vec3,
@@ -100,15 +105,16 @@ impl CameraController {
     }
 
     pub fn update_camera(&mut self, camera: &mut Camera) {
-        // Mouse zoom (scroll): move the eye toward/away from the target.
+        // Mouse zoom (scroll): scale the eye's distance to the target. Each notch
+        // moves a fixed fraction of the current distance, so zooming stays
+        // responsive at any range (and never crosses the target).
         if self.scroll_delta.abs() > 0.0 {
             let forward = camera.target - camera.eye;
             let forward_mag = forward.length();
             let forward_norm = forward / forward_mag;
-            let zoom_amount = self.scroll_delta * ZOOM_SENSITIVITY;
-            if forward_mag > zoom_amount {
-                camera.eye += forward_norm * zoom_amount;
-            }
+            let new_mag = (forward_mag * (1.0 - self.scroll_delta * ZOOM_SENSITIVITY))
+                .max(MIN_ZOOM_DISTANCE);
+            camera.eye = camera.target - forward_norm * new_mag;
             self.scroll_delta = 0.0;
         }
 
