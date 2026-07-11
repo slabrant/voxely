@@ -820,6 +820,14 @@ impl State {
                         KeyCode::Digit7 if !*repeat => { self.current_color_index = 7; return true; }
                         KeyCode::Digit8 if !*repeat => { self.current_color_index = 8; return true; }
                         KeyCode::Digit9 if !*repeat => { self.current_color_index = 9; return true; }
+                        // Direct tool hotkeys, so tools are one keypress away
+                        // instead of cycling with Tab. Digits are taken by color
+                        // selection, so tools use letters.
+                        KeyCode::KeyB if !ctrl && !*repeat => { self.tool = Tool::Build; return true; }
+                        KeyCode::KeyP if !ctrl && !*repeat => { self.tool = Tool::Paint; return true; }
+                        KeyCode::KeyF if !ctrl && !*repeat => { self.tool = Tool::Bucket; return true; }
+                        KeyCode::KeyE if !ctrl && !*repeat => { self.tool = Tool::Extrude; return true; }
+                        KeyCode::KeyM if !ctrl && !*repeat => { self.tool = Tool::Move; return true; }
                         KeyCode::KeyQ if !ctrl && !*repeat => {
                             // Arm the eyedropper: the next left-click samples the
                             // color under the cursor. Tap again to cancel. Q sits
@@ -2169,31 +2177,31 @@ impl State {
                 ui.label("Tool");
                 ui.horizontal(|ui| {
                     if ui
-                        .selectable_label(self.tool == Tool::Build, "🔨 Build")
+                        .selectable_label(self.tool == Tool::Build, "🔨 Build (B)")
                         .clicked()
                     {
                         self.tool = Tool::Build;
                     }
                     if ui
-                        .selectable_label(self.tool == Tool::Paint, "🖌 Paint")
+                        .selectable_label(self.tool == Tool::Paint, "🖌 Paint (P)")
                         .clicked()
                     {
                         self.tool = Tool::Paint;
                     }
                     if ui
-                        .selectable_label(self.tool == Tool::Bucket, "🪣 Bucket")
+                        .selectable_label(self.tool == Tool::Bucket, "🪣 Bucket (F)")
                         .clicked()
                     {
                         self.tool = Tool::Bucket;
                     }
                     if ui
-                        .selectable_label(self.tool == Tool::Extrude, "⇗ Extrude")
+                        .selectable_label(self.tool == Tool::Extrude, "⇗ Extrude (E)")
                         .clicked()
                     {
                         self.tool = Tool::Extrude;
                     }
                     if ui
-                        .selectable_label(self.tool == Tool::Move, "✥ Move")
+                        .selectable_label(self.tool == Tool::Move, "✥ Move (M)")
                         .clicked()
                     {
                         self.tool = Tool::Move;
@@ -2371,6 +2379,7 @@ impl State {
                     ui.label("Middle-drag: pan · Scroll: zoom");
                     ui.label("Ctrl + Left-drag: fill rectangle (Build)");
                     ui.label("Ctrl + Shift + Left-drag: erase rectangle");
+                    ui.label("B/P/F/E/M: pick tool (Build/Paint/Fill/Extrude/Move)");
                     ui.label("Tab / Shift + Tab: cycle tools");
                     ui.label("Bucket: click fills region · Shift + Left erases it");
                 });
