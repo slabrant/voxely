@@ -78,6 +78,14 @@ pub struct State {
     tool: Tool,
     /// Canvas dimensions edited in the UI, applied on "Resize".
     pending_size: [usize; 3],
+    /// Text buffers backing the canvas-extent fields. Only authoritative while
+    /// a field has focus; the moment it doesn't, it is rewritten from
+    /// `pending_size`. That single rule makes an external change (New/Open),
+    /// a clamped value, and invalid input all resolve on their own.
+    size_text: [String; 3],
+    /// Text buffer backing the active colour's hex field, under the same
+    /// focus-gated sync rule as `size_text`.
+    hex_text: String,
     /// Path of the current `.obj` model, if it has been saved/opened. `Save`
     /// writes here silently; `Save As` (or saving when this is `None`) prompts.
     current_path: Option<std::path::PathBuf>,
@@ -617,6 +625,8 @@ impl State {
             extrude_steps: None,
             tool: Tool::Build,
             pending_size: [chunk_w, chunk_h, chunk_d],
+            size_text: [chunk_w.to_string(), chunk_h.to_string(), chunk_d.to_string()],
+            hex_text: String::new(),
             current_path: None,
             status: None,
             last_dir: None,
@@ -2244,13 +2254,13 @@ impl State {
 
                 // Recolor the selected palette slot; existing voxels of that
                 // color update immediately via a remesh. The picker works in
-                // sRGB *byte* space (`_srgb`), the same values we store and draw
-                // the swatches with — `color_edit_button_rgb` would instead read
-                // the floats as linear and show a brighter, mismatched color.
+                // sRGB *byte* space, the same values we store and draw the
+                // swatches with — reading them as linear floats would show a
+                // brighter, mismatched color.
                 let idx = self.current_color_index as usize;
                 let c = self.palette.colors[idx];
                 let mut srgb = [c[0], c[1], c[2]];
-                if ui.color_edit_button_srgb(&mut srgb).changed() {
+                if color_picker_button(ui, &mut srgb, &mut self.hex_text) {
                     self.palette.colors[idx] = [srgb[0], srgb[1], srgb[2], 255];
                     self.remesh();
                 }
@@ -2349,18 +2359,31 @@ impl State {
                 ui.menu_button("Edit", |ui| {
                     ui.label("Canvas extents");
                     let max = crate::core::chunk::MAX_CHUNK_SIZE;
-                    // Apply when a field is committed (Enter / click-away / end of
-                    // a drag), so editing a size takes effect on its own.
+                    // Apply when a field is committed (Enter, Tab away, or a
+                    // click elsewhere — a singleline `TextEdit` surrenders focus
+                    // on Enter, so `lost_focus` covers all three), so editing a
+                    // size takes effect on its own.
                     let mut commit = false;
                     for (i, name) in ["Width", "Height", "Depth"].iter().enumerate() {
                         ui.horizontal(|ui| {
                             ui.label(format!("{name}:"));
+                            let id = egui::Id::new(("canvas_size", i));
+                            // Outside of an active edit the buffer mirrors
+                            // `pending_size`, so clamped and rejected values
+                            // snap back to what the app actually holds.
+                            if !ui.memory(|m| m.has_focus(id)) {
+                                self.size_text[i] = self.pending_size[i].to_string();
+                            }
                             let resp = ui.add(
-                                egui::DragValue::new(&mut self.pending_size[i])
-                                    .clamp_range(1..=max)
-                                    .speed(0.2),
+                                egui::TextEdit::singleline(&mut self.size_text[i])
+                                    .id(id)
+                                    .desired_width(60.0),
                             );
-                            if resp.lost_focus() || resp.drag_stopped() {
+                            select_all_on_keyboard_focus(ui, &resp, &self.size_text[i]);
+                            if resp.lost_focus() {
+                                if let Ok(val) = self.size_text[i].trim().parse::<usize>() {
+                                    self.pending_size[i] = val.clamp(1, max);
+                                }
                                 commit = true;
                             }
                         });
@@ -2385,6 +2408,275 @@ impl State {
                 });
             });
         });
+    }
+}
+
+/// Selects a text field's whole contents when focus arrives from the keyboard
+/// (Tab / Shift+Tab), so the next keystroke replaces the value instead of
+/// landing wherever egui happened to leave the caret. Clicking into a field is
+/// deliberately excluded — there the click position *is* the intended caret.
+fn select_all_on_keyboard_focus(ui: &egui::Ui, resp: &egui::Response, text: &str) {
+    if !resp.gained_focus() || resp.clicked() {
+        return;
+    }
+    let ctx = ui.ctx();
+    let mut state =
+        egui::widgets::text_edit::TextEditState::load(ctx, resp.id).unwrap_or_default();
+    state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+        egui::text::CCursor::new(0),
+        egui::text::CCursor::new(text.chars().count()),
+    )));
+    state.store(ctx, resp.id);
+}
+
+/// Parses `RRGGBB`, `#RRGGBB`, `RGB` or `#RGB` (either case) into sRGB bytes.
+/// `None` for anything else, including a partially typed value.
+fn parse_hex_rgb(s: &str) -> Option<[u8; 3]> {
+    let s = s.trim().trim_start_matches('#');
+    if !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let nib = |i: usize| u8::from_str_radix(&s[i..i + 1], 16).ok();
+    let byte = |i: usize| u8::from_str_radix(&s[i..i + 2], 16).ok();
+    match s.len() {
+        // Shorthand doubles each digit: `#1AF` is `#11AAFF`.
+        3 => Some([nib(0)? * 0x11, nib(1)? * 0x11, nib(2)? * 0x11]),
+        6 => Some([byte(0)?, byte(2)?, byte(4)?]),
+        _ => None,
+    }
+}
+
+/// The sRGB bytes a gamma-space HSV value describes.
+fn srgb_from_hsvag(hsvag: egui::ecolor::HsvaGamma) -> [u8; 3] {
+    let [r, g, b, _] = egui::ecolor::Hsva::from(hsvag).to_srgba_unmultiplied();
+    [r, g, b]
+}
+
+/// A colour swatch that opens a picker popup: a saturation/value square, a hue
+/// slider, and a single hexadecimal field.
+///
+/// This replaces [`egui::Ui::color_edit_button_srgb`], whose popup bakes in a
+/// row of R/G/B `DragValue`s. egui builds that row in private helpers
+/// (`color_picker_hsvag_2d` / `srgba_edit_ui`), so swapping it for a hex field
+/// means hand-rolling the popup rather than configuring the built-in one.
+///
+/// Works throughout in sRGB *byte* space, matching what the palette stores.
+/// Returns `true` when `srgb` changed this frame.
+fn color_picker_button(ui: &mut egui::Ui, srgb: &mut [u8; 3], hex_text: &mut String) -> bool {
+    let popup_id = ui.make_persistent_id("palette_color_popup");
+    let size = ui.spacing().interact_size;
+    let (rect, mut button_response) = ui.allocate_exact_size(size, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact(&button_response);
+        let rounding = visuals.rounding.at_most(2.0);
+        ui.painter()
+            .rect_filled(rect, rounding, egui::Color32::from_rgb(srgb[0], srgb[1], srgb[2]));
+        ui.painter().rect_stroke(rect, rounding, visuals.fg_stroke);
+    }
+    if button_response.clicked() {
+        ui.memory_mut(|m| m.toggle_popup(popup_id));
+    }
+
+    let mut changed = false;
+    if ui.memory(|m| m.is_popup_open(popup_id)) {
+        let area_response = egui::Area::new(popup_id)
+            .order(egui::Order::Foreground)
+            .fixed_pos(button_response.rect.max)
+            .constrain(true)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.spacing_mut().slider_width = 180.0;
+                    changed = color_picker_body(ui, srgb, hex_text);
+                });
+            })
+            .response;
+
+        if changed {
+            button_response.mark_changed();
+        }
+        // Same dismissal rules as egui's own picker: Escape, or a click that
+        // lands outside both the popup and the swatch that opened it.
+        if !button_response.clicked()
+            && (ui.input(|i| i.key_pressed(egui::Key::Escape)) || area_response.clicked_elsewhere())
+        {
+            ui.memory_mut(|m| m.close_popup());
+        }
+    }
+    changed
+}
+
+/// The contents of [`color_picker_button`]'s popup. Returns `true` on change.
+fn color_picker_body(ui: &mut egui::Ui, srgb: &mut [u8; 3], hex_text: &mut String) -> bool {
+    use egui::ecolor::{Hsva, HsvaGamma};
+
+    // HSV is carried across frames rather than re-derived from `srgb` every
+    // time: the round trip loses hue at zero saturation or value, which would
+    // make the hue slider snap to red the moment you drag the square into
+    // black or grey. Re-derive only when the stored value stops describing the
+    // incoming colour (a different palette slot, or an edit from elsewhere).
+    let hsv_id = ui.make_persistent_id("picker_hsv");
+    let mut hsvag: HsvaGamma = ui.memory(|m| m.data.get_temp(hsv_id)).unwrap_or_default();
+    if srgb_from_hsvag(hsvag) != *srgb {
+        hsvag = HsvaGamma::from(Hsva::from_srgb(*srgb));
+    }
+    hsvag.a = 1.0;
+
+    let before = hsvag;
+    let hue = hsvag.h;
+    sat_value_square(ui, &mut hsvag.s, &mut hsvag.v, hue);
+    hue_slider(ui, &mut hsvag.h);
+
+    let mut changed = false;
+    if hsvag != before {
+        *srgb = srgb_from_hsvag(hsvag);
+        changed = true;
+    }
+
+    // Outside of an active edit the buffer mirrors the colour, so a partial or
+    // invalid entry reverts to the canonical `#RRGGBB` the moment focus leaves.
+    let hex_id = ui.make_persistent_id("picker_hex");
+    if !ui.memory(|m| m.has_focus(hex_id)) {
+        *hex_text = format!("#{:02X}{:02X}{:02X}", srgb[0], srgb[1], srgb[2]);
+    }
+    ui.horizontal(|ui| {
+        ui.label("Hex");
+        let resp = ui.add(
+            egui::TextEdit::singleline(hex_text)
+                .id(hex_id)
+                .desired_width(80.0)
+                .char_limit(7),
+        );
+        select_all_on_keyboard_focus(ui, &resp, hex_text);
+        // Applied as you type, so the square and slider track the entry. The
+        // buffer is the user's until they leave, so a half-typed value is never
+        // overwritten mid-edit.
+        if resp.changed() {
+            if let Some(rgb) = parse_hex_rgb(hex_text) {
+                if rgb != *srgb {
+                    *srgb = rgb;
+                    hsvag = HsvaGamma::from(Hsva::from_srgb(rgb));
+                    changed = true;
+                }
+            }
+        }
+    });
+
+    ui.memory_mut(|m| m.data.insert_temp(hsv_id, hsvag));
+    changed
+}
+
+/// A saturation (x) by value (y) square for a fixed hue. Mirrors egui's private
+/// `color_slider_2d`.
+fn sat_value_square(ui: &mut egui::Ui, s: &mut f32, v: &mut f32, hue: f32) {
+    use egui::{lerp, pos2, remap_clamp};
+    const N: u32 = 6;
+
+    let size = egui::Vec2::splat(ui.spacing().slider_width);
+    let (rect, response) = ui.allocate_at_least(size, egui::Sense::click_and_drag());
+    if let Some(mpos) = response.interact_pointer_pos() {
+        *s = remap_clamp(mpos.x, rect.left()..=rect.right(), 0.0..=1.0);
+        *v = remap_clamp(mpos.y, rect.bottom()..=rect.top(), 0.0..=1.0);
+    }
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+
+    let color_at = |s: f32, v: f32| {
+        egui::Color32::from(egui::ecolor::Hsva::from(egui::ecolor::HsvaGamma {
+            h: hue,
+            s,
+            v,
+            a: 1.0,
+        }))
+    };
+
+    let mut mesh = egui::Mesh::default();
+    for xi in 0..=N {
+        for yi in 0..=N {
+            let (xt, yt) = (xi as f32 / N as f32, yi as f32 / N as f32);
+            mesh.colored_vertex(
+                pos2(
+                    lerp(rect.left()..=rect.right(), xt),
+                    lerp(rect.bottom()..=rect.top(), yt),
+                ),
+                color_at(xt, yt),
+            );
+            if xi < N && yi < N {
+                let tl = yi * (N + 1) + xi;
+                mesh.add_triangle(tl, tl + 1, tl + N + 1);
+                mesh.add_triangle(tl + 1, tl + N + 1, tl + N + 2);
+            }
+        }
+    }
+    ui.painter().add(egui::Shape::mesh(mesh));
+    ui.painter()
+        .rect_stroke(rect, 0.0, ui.style().interact(&response).bg_stroke);
+
+    let picked = color_at(*s, *v);
+    ui.painter().add(egui::epaint::CircleShape {
+        center: pos2(
+            lerp(rect.left()..=rect.right(), *s),
+            lerp(rect.bottom()..=rect.top(), *v),
+        ),
+        radius: rect.width() / 12.0,
+        fill: picked,
+        stroke: egui::Stroke::new(2.0, contrast_color(picked)),
+    });
+}
+
+/// A horizontal hue strip. Mirrors egui's private `color_slider_1d`.
+fn hue_slider(ui: &mut egui::Ui, hue: &mut f32) {
+    use egui::{lerp, pos2, remap_clamp};
+    const N: u32 = 6;
+
+    let size = egui::vec2(ui.spacing().slider_width, ui.spacing().interact_size.y);
+    let (rect, response) = ui.allocate_at_least(size, egui::Sense::click_and_drag());
+    if let Some(mpos) = response.interact_pointer_pos() {
+        *hue = remap_clamp(mpos.x, rect.left()..=rect.right(), 0.0..=1.0);
+    }
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+
+    // Full saturation and value so the strip reads as a pure hue ramp.
+    let color_at =
+        |t: f32| egui::Color32::from(egui::ecolor::Hsva::new(t, 1.0, 1.0, 1.0));
+
+    let mut mesh = egui::Mesh::default();
+    for i in 0..=N {
+        let t = i as f32 / N as f32;
+        let x = lerp(rect.left()..=rect.right(), t);
+        mesh.colored_vertex(pos2(x, rect.top()), color_at(t));
+        mesh.colored_vertex(pos2(x, rect.bottom()), color_at(t));
+        if i < N {
+            mesh.add_triangle(2 * i, 2 * i + 1, 2 * i + 2);
+            mesh.add_triangle(2 * i + 1, 2 * i + 2, 2 * i + 3);
+        }
+    }
+    ui.painter().add(egui::Shape::mesh(mesh));
+    ui.painter()
+        .rect_stroke(rect, 0.0, ui.style().interact(&response).bg_stroke);
+
+    let x = lerp(rect.left()..=rect.right(), *hue);
+    let r = rect.height() / 4.0;
+    let picked = color_at(*hue);
+    ui.painter().add(egui::Shape::convex_polygon(
+        vec![
+            pos2(x, rect.center().y),
+            pos2(x + r, rect.bottom()),
+            pos2(x - r, rect.bottom()),
+        ],
+        picked,
+        egui::Stroke::new(2.0, contrast_color(picked)),
+    ));
+}
+
+/// Black or white, whichever stays legible on top of `color`.
+fn contrast_color(color: egui::Color32) -> egui::Color32 {
+    if egui::ecolor::Rgba::from(color).intensity() < 0.5 {
+        egui::Color32::WHITE
+    } else {
+        egui::Color32::BLACK
     }
 }
 
