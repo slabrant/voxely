@@ -47,13 +47,13 @@ impl State {
                     let erase = self.drag_erase;
                     if self.rect_drag.is_some() {
                         self.update_rect();
-                    } else if self.tool == Tool::Extrude || self.tool == Tool::Move {
+                    } else if self.extrude_start.is_some() || self.move_start.is_some() {
                         // Both are click-and-drag along an axis; the live preview
                         // is rebuilt in `update_overlay`, so nothing to do here.
                         self.handle_extrude_drag(erase);
-                    } else if self.tool != Tool::Bucket {
-                        // Build and Paint both stroke along the drag; Bucket is
-                        // click-only.
+                    } else if !self.flooding {
+                        // Build and Paint both stroke along the drag; a flood is
+                        // click-only and must not smear as the cursor moves.
                         self.handle_drag(erase);
                     }
                 }
@@ -94,24 +94,34 @@ impl State {
                                 // Every gesture (click, drag, rectangle, bucket)
                                 // is one undo step; bracket it here, close on release.
                                 self.history.begin_group();
-                                if self.tool == Tool::Bucket {
-                                    self.handle_bucket(erase);
-                                } else if self.tool == Tool::Extrude {
-                                    self.handle_extrude_click(erase);
-                                } else if self.tool == Tool::Move {
+                                self.flooding = false;
+                                match (self.pending_action, self.tool) {
+                                    // An armed one-shot wins over whatever the
+                                    // active tool would have done.
+                                    (Some(Action::Bucket), _) => {
+                                        self.flooding = true;
+                                        self.handle_bucket(erase);
+                                    }
+                                    (Some(Action::Extrude), _) => self.handle_extrude_click(erase),
                                     // Grab the whole connected object under the
                                     // cursor; the drag slides it (commit on release).
-                                    self.handle_move_click();
-                                } else if self.tool == Tool::Build && ctrl {
-                                    // Ctrl+Left-drag fills a plane-locked
-                                    // rectangle; +Shift erases it instead.
-                                    self.begin_rect(erase);
-                                } else {
+                                    (Some(Action::Move), _) => self.handle_move_click(),
+                                    // Ctrl is the "act on a whole area" modifier:
+                                    // a plane-locked rectangle under Build, the
+                                    // connected region under Paint. +Shift erases
+                                    // instead of writing, as everywhere else.
+                                    (None, Tool::Build) if ctrl => self.begin_rect(erase),
+                                    (None, Tool::Paint) if ctrl => {
+                                        self.flooding = true;
+                                        self.handle_bucket(erase);
+                                    }
                                     // Freehand stroke. An erase stroke carves the
                                     // visible surface without drilling through:
                                     // see `is_erasing_gesture` / `raycast`.
-                                    self.is_erasing_gesture = erase;
-                                    self.handle_click(erase);
+                                    (None, _) => {
+                                        self.is_erasing_gesture = erase;
+                                        self.handle_click(erase);
+                                    }
                                 }
                             }
                         } else {
@@ -135,6 +145,10 @@ impl State {
                                 self.move_start = None;
                                 self.move_steps = None;
                                 self.history.end_group();
+                                // The armed one-shot has been applied; hand
+                                // control back to the drawing tool.
+                                self.pending_action = None;
+                                self.flooding = false;
                                 self.last_grid_coord = None;
                                 self.drag_start_voxels.clear();
                                 self.is_erasing_gesture = false;
@@ -184,11 +198,13 @@ impl State {
                         // Direct tool hotkeys, so tools are one keypress away
                         // instead of cycling with Tab. Digits are taken by color
                         // selection, so tools use letters.
-                        KeyCode::KeyB if !ctrl && !*repeat => { self.tool = Tool::Build; return true; }
-                        KeyCode::KeyP if !ctrl && !*repeat => { self.tool = Tool::Paint; return true; }
-                        KeyCode::KeyF if !ctrl && !*repeat => { self.tool = Tool::Bucket; return true; }
-                        KeyCode::KeyE if !ctrl && !*repeat => { self.tool = Tool::Extrude; return true; }
-                        KeyCode::KeyM if !ctrl && !*repeat => { self.tool = Tool::Move; return true; }
+                        KeyCode::KeyB if !ctrl && !*repeat => { self.tool = Tool::Build; self.pending_action = None; return true; }
+                        KeyCode::KeyP if !ctrl && !*repeat => { self.tool = Tool::Paint; self.pending_action = None; return true; }
+                        // One-shot actions arm rather than switch mode; pressing
+                        // the same key again disarms.
+                        KeyCode::KeyF if !ctrl && !*repeat => { self.arm_action(Action::Bucket); return true; }
+                        KeyCode::KeyE if !ctrl && !*repeat => { self.arm_action(Action::Extrude); return true; }
+                        KeyCode::KeyM if !ctrl && !*repeat => { self.arm_action(Action::Move); return true; }
                         KeyCode::KeyQ if !ctrl && !*repeat => {
                             // Arm the eyedropper: the next left-click samples the
                             // color under the cursor. Tap again to cancel. Q sits

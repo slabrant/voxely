@@ -41,7 +41,7 @@ cargo test               # run the test suite
 
 ### Cross-compiling to Windows (from Linux)
 
-`Cargo.toml` is preconfigured for the `mingw-w64` toolchain:
+`.cargo/config.toml` is preconfigured for the `mingw-w64` toolchain:
 
 ```sh
 sudo apt install mingw-w64
@@ -56,10 +56,12 @@ cargo build --release --target x86_64-pc-windows-gnu
 | Build / paint voxel (active tool) | Left-click / left-drag |
 | Erase voxel | Shift + left-click / drag |
 | Eyedropper (sample color) | Press `Q`, then left-click (or Alt + left-click) |
-| Cycle tool (Build → Paint → Bucket → Extrude) | `Tab` / `Shift`+`Tab` (reverse) |
+| Switch tool (Build ↔ Paint) | `B` / `P`, or `Tab` |
 | Fill rectangle | Ctrl + left-drag (Build) |
-| Erase rectangle | Ctrl + Shift + left-drag |
-| Paint bucket | Bucket tool, click to fill — Shift + left-click to erase region |
+| Erase rectangle | Ctrl + Shift + left-drag (Build) |
+| Flood fill region | Ctrl + left-click (Paint) |
+| Flood erase region | Ctrl + Shift + left-click (Paint) |
+| Fill / Extrude / Move (single use) | `F` / `E` / `M`, then click — reverts to the tool |
 | Pick color | `1`–`9`, or click a palette swatch |
 | Orbit / pan / zoom | Right-drag / middle-drag / scroll |
 | Undo / redo | Ctrl+Z / Ctrl+Y (or Ctrl+Shift+Z) |
@@ -68,4 +70,6 @@ cargo build --release --target x86_64-pc-windows-gnu
 File, Edit (canvas extents), and Help live in the top menu bar.
 
 Tools, history, file actions, canvas size, and the palette are also available in
-the left-hand panel.
+the left-hand panel. The panel has two rows: **Tool** is the mode you stay in
+(and the only thing `Tab` cycles), while **Action** items apply once and then
+hand control back to the active tool.

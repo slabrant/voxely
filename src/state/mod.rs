@@ -101,6 +101,12 @@ pub struct State {
     rect_drag: Option<RectDrag>,
     extrude_steps: Option<i32>,
     tool: Tool,
+    /// A one-shot operation waiting for its click. Cleared as soon as it has
+    /// been applied, which returns control to `tool`.
+    pending_action: Option<Action>,
+    /// True for the duration of a left-button gesture that began as a flood
+    /// fill, so cursor motion during it doesn't also stroke.
+    flooding: bool,
     /// Set by [`remesh`](State::remesh); the mesh is rebuilt at most once per
     /// frame in [`flush_mesh`](State::flush_mesh).
     mesh_dirty: bool,
@@ -125,22 +131,33 @@ pub struct State {
     last_dir: Option<std::path::PathBuf>,
 }
 
-/// The active editing tool, chosen from the UI or with a hotkey.
+/// A persistent drawing tool. These are the modes you stay in, and the only
+/// things Tab cycles between — see [`Action`] for the one-shot operations.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tool {
     /// Add voxels: left-click/drag places (and ctrl-drag fills a rectangle).
     /// Geometry only — erasing lives on Shift+Left-click for every tool.
     Build,
     /// Recolor existing voxels to the active color. Never adds or removes
-    /// geometry: clicks/drags over empty space do nothing.
+    /// geometry: clicks/drags over empty space do nothing. Ctrl+Left floods a
+    /// whole connected region instead of stroking across it.
     Paint,
-    /// Flood-fill a connected region of one color (click to apply).
+}
+
+/// A one-shot operation. Arming one costs a click or a keypress and it applies
+/// exactly once, then the active [`Tool`] resumes — none of these is a mode you
+/// want to be left sitting in, and they are deliberately outside the Tab cycle
+/// so cycling tools can't drop you into one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Action {
+    /// Flood-fill a connected region of one color. Also available without
+    /// arming, as Ctrl+Left while the Paint tool is active.
     Bucket,
     /// Pull a face along its normal (click and drag).
     Extrude,
     /// Slide a whole connected object along the clicked face's normal (click and
     /// drag). The grabbed object is every voxel reachable from the hit one
-    /// through shared faces, regardless of color.
+    /// through shared faces, edges or corners, regardless of color.
     Move,
 }
 
@@ -205,25 +222,30 @@ impl State {
         }
     }
 
-    /// Switches to the next tool, or the previous one when `reverse` is set
-    /// (Shift+Tab). Order: Build → Paint → Bucket → Extrude → Move → Build.
-    pub(super) fn cycle_tool(&mut self, reverse: bool) {
-        self.tool = if reverse {
-            match self.tool {
-                Tool::Build => Tool::Move,
-                Tool::Paint => Tool::Build,
-                Tool::Bucket => Tool::Paint,
-                Tool::Extrude => Tool::Bucket,
-                Tool::Move => Tool::Extrude,
-            }
+    /// Switches between the drawing tools (Tab, or Shift+Tab for `reverse`).
+    /// Only [`Tool`] takes part; the one-shot [`Action`]s are excluded on
+    /// purpose, so cycling can never strand you in a single-use mode.
+    ///
+    /// Cycling also disarms any pending action — Tab means "change what I am
+    /// drawing with", which is exactly the intent that abandons a queued
+    /// one-shot.
+    pub(super) fn cycle_tool(&mut self, _reverse: bool) {
+        self.pending_action = None;
+        self.tool = match self.tool {
+            Tool::Build => Tool::Paint,
+            Tool::Paint => Tool::Build,
+        };
+    }
+
+    /// Arms a one-shot action, or disarms it if it was already armed so the
+    /// button and hotkey both toggle.
+    pub(super) fn arm_action(&mut self, action: Action) {
+        self.pending_action = if self.pending_action == Some(action) {
+            None
         } else {
-            match self.tool {
-                Tool::Build => Tool::Paint,
-                Tool::Paint => Tool::Bucket,
-                Tool::Bucket => Tool::Extrude,
-                Tool::Extrude => Tool::Move,
-                Tool::Move => Tool::Build,
-            }
+            // The eyedropper is a one-shot too; only one can be pending.
+            self.eyedropper_armed = false;
+            Some(action)
         };
     }
 

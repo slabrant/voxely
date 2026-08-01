@@ -469,6 +469,8 @@ impl State {
             rect_drag: None,
             extrude_steps: None,
             tool: Tool::Build,
+            pending_action: None,
+            flooding: false,
             mesh_dirty: true,
             pending_size: [chunk_w, chunk_h, chunk_d],
             size_text: [chunk_w.to_string(), chunk_h.to_string(), chunk_d.to_string()],

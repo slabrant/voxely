@@ -78,6 +78,12 @@ impl State {
                 self.palette = project.palette;
                 self.history.clear();
                 self.sync_to_chunk();
+                // Frame the model we just opened. Without this the camera keeps
+                // whatever position it had, and opening anything bigger than the
+                // default canvas leaves the eye *inside* the model -- every ray
+                // then starts in a solid voxel, so clicking appears to do nothing
+                // at all.
+                self.frame_camera_to_chunk();
                 println!("Opened {}", path.display());
                 self.current_path = Some(path.to_path_buf());
                 self.remember_dir(path);
@@ -97,6 +103,7 @@ impl State {
         self.palette = Palette::default();
         self.history.clear();
         self.sync_to_chunk();
+        self.frame_camera_to_chunk();
         self.current_path = None;
     }
 

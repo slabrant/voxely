@@ -18,39 +18,43 @@ impl State {
                 ui.heading("Voxely");
                 ui.separator();
 
+                // Two rows, because the two kinds of thing behave differently: the
+                // top row is the mode you stay in and Tab cycles, the bottom row
+                // is armed for a single use and then hands control back.
                 ui.label("Tool");
                 ui.horizontal(|ui| {
-                    if ui
-                        .selectable_label(self.tool == Tool::Build, "🔨 Build (B)")
-                        .clicked()
-                    {
-                        self.tool = Tool::Build;
-                    }
-                    if ui
-                        .selectable_label(self.tool == Tool::Paint, "🖌 Paint (P)")
-                        .clicked()
-                    {
-                        self.tool = Tool::Paint;
-                    }
-                    if ui
-                        .selectable_label(self.tool == Tool::Bucket, "🪣 Bucket (F)")
-                        .clicked()
-                    {
-                        self.tool = Tool::Bucket;
-                    }
-                    if ui
-                        .selectable_label(self.tool == Tool::Extrude, "⇗ Extrude (E)")
-                        .clicked()
-                    {
-                        self.tool = Tool::Extrude;
-                    }
-                    if ui
-                        .selectable_label(self.tool == Tool::Move, "✥ Move (M)")
-                        .clicked()
-                    {
-                        self.tool = Tool::Move;
+                    for (tool, label) in [
+                        (Tool::Build, "🔨 Build (B)"),
+                        (Tool::Paint, "🖌 Paint (P)"),
+                    ] {
+                        if ui.selectable_label(self.tool == tool, label).clicked() {
+                            self.tool = tool;
+                            self.pending_action = None;
+                        }
                     }
                 });
+
+                ui.label("Action (single use)");
+                ui.horizontal(|ui| {
+                    for (action, label) in [
+                        (Action::Bucket, "🪣 Fill (F)"),
+                        (Action::Extrude, "⇗ Extrude (E)"),
+                        (Action::Move, "✥ Move (M)"),
+                    ] {
+                        let armed = self.pending_action == Some(action);
+                        if ui.selectable_label(armed, label).clicked() {
+                            self.arm_action(action);
+                        }
+                    }
+                });
+                if let Some(action) = self.pending_action {
+                    let what = match action {
+                        Action::Bucket => "fill the region you click",
+                        Action::Extrude => "extrude the face you drag",
+                        Action::Move => "move the object you drag",
+                    };
+                    ui.colored_label(egui::Color32::from_rgb(102, 255, 102), format!("Next click will {what}"));
+                }
 
                 // Eyedropper is modal: tapping `Q` arms it; the next click samples.
                 if ui
@@ -235,10 +239,12 @@ impl State {
                     ui.label("Right-drag: orbit");
                     ui.label("Middle-drag: pan · Scroll: zoom");
                     ui.label("Ctrl + Left-drag: fill rectangle (Build)");
-                    ui.label("Ctrl + Shift + Left-drag: erase rectangle");
-                    ui.label("B/P/F/E/M: pick tool (Build/Paint/Fill/Extrude/Move)");
-                    ui.label("Tab / Shift + Tab: cycle tools");
-                    ui.label("Bucket: click fills region · Shift + Left erases it");
+                    ui.label("Ctrl + Shift + Left-drag: erase rectangle (Build)");
+                    ui.label("Ctrl + Left: flood fill region (Paint)");
+                    ui.label("Ctrl + Shift + Left: flood erase region (Paint)");
+                    ui.label("B / P: pick tool (Build / Paint)");
+                    ui.label("Tab: switch tool (Build ↔ Paint)");
+                    ui.label("F / E / M: arm Fill / Extrude / Move for one use");
                 });
             });
         });
