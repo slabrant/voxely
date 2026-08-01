@@ -1,0 +1,6 @@
+# Cargo reads per-target build settings from here. These same keys in Cargo.toml
+# are silently ignored ("unused manifest key"), so the Windows cross-build was
+# falling back to whatever linker the toolchain defaulted to.
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+ar = "x86_64-w64-mingw32-ar"

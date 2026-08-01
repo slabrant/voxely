@@ -26,6 +26,14 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      # Gate the release on the test suite and a clean lint. Without this every
+      # push to main ships, passing or not.
+      - name: Test
+        run: cargo test --release
+
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+
       - name: Build Windows
         run: cargo build --target x86_64-pc-windows-gnu --release
 

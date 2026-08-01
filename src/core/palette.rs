@@ -1,10 +1,8 @@
-use serde::{Deserialize, Serialize};
-
 /// Number of color slots. Index 0 is reserved for "empty" (no voxel).
 pub const PALETTE_SIZE: usize = 256;
 
 /// A fixed-size color palette. Voxels store a `color_index` into this table.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct Palette {
     /// sRGB colors, one per index. Stored as `[r, g, b, a]` bytes.
     pub colors: Vec<[u8; 4]>,

@@ -142,6 +142,10 @@ pub fn mesh_chunk(chunk: &Chunk, palette: &Palette) -> (Vec<Vertex>, Vec<u32>) {
     (vertices, indices)
 }
 
+/// Eight parameters is a lot, but they are the quad's full definition and each
+/// is used exactly once; bundling them into a struct would only move the same
+/// list one line up.
+#[allow(clippy::too_many_arguments)]
 fn add_quad(
     vertices: &mut Vec<Vertex>,
     indices: &mut Vec<u32>,

@@ -1,5 +1,4 @@
 use super::Voxel;
-use serde::{Serialize, Deserialize};
 
 /// Default canvas dimensions for a fresh chunk.
 pub const DEFAULT_CHUNK_SIZE: usize = 16;
@@ -9,12 +8,17 @@ pub const MAX_CHUNK_SIZE: usize = 256;
 
 /// A dense voxel grid. Dimensions are chosen at runtime (and changeable from the
 /// UI), so they live as fields rather than compile-time constants.
-#[derive(Serialize, Deserialize)]
 pub struct Chunk {
     pub width: usize,
     pub height: usize,
     pub depth: usize,
     pub voxels: Vec<Voxel>,
+}
+
+impl Default for Chunk {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Chunk {

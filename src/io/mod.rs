@@ -359,7 +359,7 @@ pub fn load_obj(path: impl AsRef<Path>) -> Result<Project, Box<dyn Error>> {
                             .get(name)
                             .ok_or_else(|| err(&format!("material '{name}' is not defined in the .mtl")))?;
                         if next_color == u8::MAX {
-                            return Err(err("too many materials (max 255)"));
+                            return Err(err("too many materials (max 254)"));
                         }
                         let slot = next_color;
                         palette.colors[slot as usize] = rgba;

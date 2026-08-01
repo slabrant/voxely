@@ -51,11 +51,10 @@ impl EditHistory {
     /// Closes the open group, committing it to the undo stack if it touched
     /// anything. An empty group (a gesture that changed nothing) is dropped.
     pub fn end_group(&mut self) {
-        if let Some(group) = self.current.take() {
-            if !group.is_empty() {
+        if let Some(group) = self.current.take()
+            && !group.is_empty() {
                 self.push_undo(Rc::new(group));
             }
-        }
     }
 
     /// Commits a group and drops the oldest once the stack is over depth.
@@ -81,14 +80,12 @@ impl EditHistory {
     /// in place instead of appending a new one, so a drag that lingers on one
     /// voxel doesn't bloat the group.
     pub fn record_continuous(&mut self, edit: VoxelEdit) {
-        if let Some(group) = &mut self.current {
-            if let Some(last) = group.last_mut() {
-                if last.x == edit.x && last.y == edit.y && last.z == edit.z {
+        if let Some(group) = &mut self.current
+            && let Some(last) = group.last_mut()
+                && last.x == edit.x && last.y == edit.y && last.z == edit.z {
                     last.new = edit.new;
                     return;
                 }
-            }
-        }
         self.record(edit);
     }
 

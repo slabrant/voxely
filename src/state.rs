@@ -277,9 +277,7 @@ impl State {
         // one will result in all the colors coming out darker. If you want to support non-sRGB
         // surfaces, you'll need to account for that when drawing to the frame.
         let surface_format = surface_caps.formats.iter()
-            .copied()
-            .filter(|f| f.is_srgb())
-            .next()
+            .copied().find(|f| f.is_srgb())
             .unwrap_or(surface_caps.formats[0]);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -681,12 +679,10 @@ impl State {
                 },
             ..
         } = event
-        {
-            if !self.egui_ctx.wants_keyboard_input() {
+            && !self.egui_ctx.wants_keyboard_input() {
                 self.cycle_tool(self.modifiers.shift_key());
                 return true;
             }
-        }
 
         // Let egui handle the event first; if it's consumed (e.g. a click on a
         // panel), don't also treat it as a scene/camera interaction.
@@ -735,7 +731,7 @@ impl State {
                             self.is_left_mouse_pressed = true;
                             if self.eyedropper_armed || (alt && !ctrl && !shift) {
                                 // Eyedropper: adopt the color under the cursor,
-                                // either armed (tapped `I`) or via Alt+Left where
+                                // either armed (tapped `Q`) or via Alt+Left where
                                 // the WM allows it. No edit -> no history.
                                 self.pick_color();
                                 self.eyedropper_armed = false;
@@ -826,7 +822,7 @@ impl State {
                 // egui isn't holding the keyboard. Ctrl-chords are unambiguous
                 // and stay live either way.
                 let typing = self.egui_ctx.wants_keyboard_input();
-                if pressed && !(typing && !ctrl) {
+                if pressed && (ctrl || !typing) {
                     match key {
                         KeyCode::Digit1 if !*repeat => { self.current_color_index = 1; return true; }
                         KeyCode::Digit2 if !*repeat => { self.current_color_index = 2; return true; }
@@ -1208,8 +1204,8 @@ impl State {
             if pos[0] < 0 || pos[1] < 0 || pos[2] < 0 {
                 return;
             }
-            if let Some(v) = self.chunk.get(pos[0] as usize, pos[1] as usize, pos[2] as usize) {
-                if !v.is_empty() {
+            if let Some(v) = self.chunk.get(pos[0] as usize, pos[1] as usize, pos[2] as usize)
+                && !v.is_empty() {
                     let normal_i = [normal[0] as i32, normal[1] as i32, normal[2] as i32];
                     let target_color = v.color_index;
                     
@@ -1233,9 +1229,9 @@ impl State {
                             next[u_axis] += du;
                             next[v_axis] += dv;
                             
-                            if !visited.contains(&next) {
-                                if let Some(nv) = self.chunk.get(next[0] as usize, next[1] as usize, next[2] as usize) {
-                                    if nv.color_index == target_color {
+                            if !visited.contains(&next)
+                                && let Some(nv) = self.chunk.get(next[0] as usize, next[1] as usize, next[2] as usize)
+                                    && nv.color_index == target_color {
                                         // Check if this voxel also has an exposed face in the same direction.
                                         // A face is exposed if the neighbor in the normal direction is empty.
                                         let neighbor_pos = [
@@ -1244,9 +1240,9 @@ impl State {
                                             next[2] + normal_i[2],
                                         ];
                                         let is_exposed = self.chunk.get(
-                                            neighbor_pos[0] as i32 as usize,
-                                            neighbor_pos[1] as i32 as usize,
-                                            neighbor_pos[2] as i32 as usize
+                                            neighbor_pos[0] as usize,
+                                            neighbor_pos[1] as usize,
+                                            neighbor_pos[2] as usize
                                         ).map(|v| v.is_empty()).unwrap_or(true);
                                         
                                         if is_exposed {
@@ -1254,8 +1250,6 @@ impl State {
                                             stack.push(next);
                                         }
                                     }
-                                }
-                            }
                         }
                     }
 
@@ -1264,7 +1258,6 @@ impl State {
                     self.extrude_steps = Some(0);
                     self.last_grid_coord = Some(pos);
                 }
-            }
         }
     }
 
@@ -1518,7 +1511,6 @@ impl State {
                 return;
             }
             self.extrude_steps = Some(steps);
-            self.num_overlay_vertices = 0; // Force a rebuild if we didn't return early
 
             let color = if self.drag_erase { [1.0, 0.3, 0.3] } else { [0.4, 0.8, 1.0] };
             let axis = if normal[0] != 0 { 0 } else if normal[1] != 0 { 1 } else { 2 };
@@ -1886,7 +1878,7 @@ impl State {
             }
         }
 
-        return Some((coord, inward_normal, false));
+        Some((coord, inward_normal, false))
     }
 
     /// Resizes the canvas, keeping voxels that still fit (anchored at the
@@ -2671,15 +2663,13 @@ fn color_picker_body(ui: &mut egui::Ui, srgb: &mut [u8; 3], hex_text: &mut Strin
         // Applied as you type, so the square and slider track the entry. The
         // buffer is the user's until they leave, so a half-typed value is never
         // overwritten mid-edit.
-        if resp.changed() {
-            if let Some(rgb) = parse_hex_rgb(hex_text) {
-                if rgb != *srgb {
+        if resp.changed()
+            && let Some(rgb) = parse_hex_rgb(hex_text)
+                && rgb != *srgb {
                     *srgb = rgb;
                     hsvag = HsvaGamma::from(Hsva::from_srgb(rgb));
                     changed = true;
                 }
-            }
-        }
     });
 
     ui.memory_mut(|m| m.data.insert_temp(hsv_id, hsvag));
