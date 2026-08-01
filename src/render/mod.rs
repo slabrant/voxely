@@ -2,6 +2,10 @@ use crate::core::Chunk;
 use crate::core::Palette;
 use crate::state::Vertex;
 
+#[cfg(test)]
+#[path = "reference_mesher.rs"]
+mod reference_mesher;
+
 /// One entry of a slice mask: `0` means "no face here", otherwise the low byte
 /// is the color index (never 0 for a face, since color 0 *is* empty) and bit 8
 /// records which way the face points. Packing it into a `u16` rather than an
@@ -195,6 +199,39 @@ mod tests {
                     "vertex coord {c} escaped the [{p}, {}] cube",
                     p + 1.0
                 );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod parity {
+    use super::*;
+    use crate::core::Voxel;
+
+    /// The rewritten mesher must emit exactly the same buffers as the original,
+    /// vertex for vertex and index for index -- not merely the same counts.
+    #[test]
+    fn matches_the_original_mesher_byte_for_byte() {
+        for n in [1usize, 2, 5, 16, 33] {
+            let mut c = Chunk::with_size(n, n + 1, n + 2);
+            // A mix of solid, hollow, single-voxel and multi-color regions so
+            // both the greedy merge and the slice boundaries get exercised.
+            for x in 0..c.width { for y in 0..c.height { for z in 0..c.depth {
+                let solid = (x * 7 + y * 13 + z * 3) % 5 < 3 || (x == y && y == z);
+                if solid {
+                    c.set(x, y, z, Voxel { color_index: 1 + ((x + 2 * y + 3 * z) % 6) as u8 });
+                }
+            }}}
+            let p = Palette::default();
+            let (nv, ni) = mesh_chunk(&c, &p);
+            let (ov, oi) = super::reference_mesher::mesh_chunk_old(&c, &p);
+            assert_eq!(ni, oi, "index buffer differs at {n}");
+            assert_eq!(nv.len(), ov.len(), "vertex count differs at {n}");
+            for (k, (a, b)) in nv.iter().zip(ov.iter()).enumerate() {
+                assert_eq!(a.position, b.position, "vertex {k} position differs at {n}");
+                assert_eq!(a.color, b.color, "vertex {k} color differs at {n}");
+                assert_eq!(a.normal, b.normal, "vertex {k} normal differs at {n}");
             }
         }
     }
