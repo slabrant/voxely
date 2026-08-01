@@ -29,7 +29,7 @@ pub struct State {
     line_vertex_buffer: wgpu::Buffer,
     overlay_vertex_buffer: wgpu::Buffer,
     num_indices: u32,
-    num_line_indices: u32,
+    num_line_vertices: u32,
     num_overlay_vertices: u32,
     camera: Camera,
     camera_uniform: CameraUniform,
@@ -72,10 +72,16 @@ pub struct State {
     /// Step count the Move overlay was last drawn for, so cursor motion that
     /// doesn't change the snapped offset skips a rebuild.
     move_steps: Option<i32>,
-    drag_start_voxels: Vec<[i32; 3]>,
+    /// Voxels placed during the current gesture, excluded from raycasting so a
+    /// stroke doesn't climb its own output. A set, not a list: `raycast` probes
+    /// it on every hit, and a rectangle fill can put tens of thousands in it.
+    drag_start_voxels: std::collections::HashSet<[i32; 3]>,
     rect_drag: Option<RectDrag>,
     extrude_steps: Option<i32>,
     tool: Tool,
+    /// Set by [`remesh`](State::remesh); the mesh is rebuilt at most once per
+    /// frame in [`flush_mesh`](State::flush_mesh).
+    mesh_dirty: bool,
     /// Canvas dimensions edited in the UI, applied on "Resize".
     pending_size: [usize; 3],
     /// Text buffers backing the canvas-extent fields. Only authoritative while
@@ -280,7 +286,14 @@ impl State {
             format: surface_format,
             width: size.width,
             height: size.height,
-            present_mode: surface_caps.present_modes[0],
+            // Vsync. `present_modes[0]` is whatever the adapter happens to list
+            // first, which on some backends is `Immediate` — combined with the
+            // unconditional redraw in `lib.rs` that pins the GPU at 100%.
+            present_mode: if surface_caps.present_modes.contains(&wgpu::PresentMode::Fifo) {
+                wgpu::PresentMode::Fifo
+            } else {
+                surface_caps.present_modes[0]
+            },
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -531,27 +544,14 @@ impl State {
         let chunk = crate::core::Chunk::new();
         let (chunk_w, chunk_h, chunk_d) = (chunk.width, chunk.height, chunk.depth);
 
-        let (mesh_vertices, mesh_indices) = crate::render::mesh_chunk(&chunk, &palette);
-
-        let vertex_buffer = device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
-                label: Some("Vertex Buffer"),
-                contents: bytemuck::cast_slice(&mesh_vertices),
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            }
-        );
-
-        let index_buffer = device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
-                label: Some("Index Buffer"),
-                contents: bytemuck::cast_slice(&mesh_indices),
-                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-            }
-        );
-        let num_indices = mesh_indices.len() as u32;
+        // Mesh buffers start empty and grow on first use; a fresh canvas has no
+        // geometry, and `num_indices == 0` means nothing is drawn from them.
+        let vertex_buffer = new_growable_buffer(&device, "Vertex Buffer", wgpu::BufferUsages::VERTEX);
+        let index_buffer = new_growable_buffer(&device, "Index Buffer", wgpu::BufferUsages::INDEX);
+        let num_indices = 0;
 
         let line_vertices = bounding_box_lines(&chunk);
-        let num_line_indices = line_vertices.len() as u32;
+        let num_line_vertices = line_vertices.len() as u32;
 
         let line_vertex_buffer = device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
@@ -593,7 +593,7 @@ impl State {
             line_vertex_buffer,
             overlay_vertex_buffer,
             num_indices,
-            num_line_indices,
+            num_line_vertices,
             num_overlay_vertices: 0,
             camera,
             camera_uniform,
@@ -620,10 +620,11 @@ impl State {
             extrude_start: None,
             move_start: None,
             move_steps: None,
-            drag_start_voxels: Vec::new(),
+            drag_start_voxels: std::collections::HashSet::new(),
             rect_drag: None,
             extrude_steps: None,
             tool: Tool::Build,
+            mesh_dirty: true,
             pending_size: [chunk_w, chunk_h, chunk_d],
             size_text: [chunk_w.to_string(), chunk_h.to_string(), chunk_d.to_string()],
             hex_text: String::new(),
@@ -1664,7 +1665,7 @@ impl State {
 
         if self.is_left_mouse_pressed && !voxel.is_empty() {
             // Voxels placed this drag session are excluded from raycasting.
-            self.drag_start_voxels.push([x, y, z]);
+            self.drag_start_voxels.insert([x, y, z]);
         } else if self.is_erasing_gesture && voxel.is_empty() {
             // Cells cleared this erase stroke keep blocking the ray (see
             // `raycast`), so the stroke carves the surface without tunnelling.
@@ -1727,13 +1728,36 @@ impl State {
     }
 
     fn raycast(&self, origin: glam::Vec3, dir: glam::Vec3) -> Option<([i32; 3], [f32; 3], bool)> {
-        let max_dist = 100.0;
+        let dims = [self.chunk.width as i32, self.chunk.height as i32, self.chunk.depth as i32];
+
+        // Clip the ray to the canvas box before traversing it. The walk used to
+        // start at the eye and give up after a fixed 100 units, so once the
+        // camera was zoomed further out than that the ray ran out before it
+        // reached the model and the cursor silently vanished. Bounding the walk
+        // by the box instead makes it independent of camera distance — and
+        // cheaper, since the step count now scales with the canvas instead of
+        // with the zoom.
+        //
+        // A degenerate direction would leave the box unbounded on every axis
+        // and spin the traversal forever, where the old fixed reach merely ran
+        // out; reject it up front.
+        if !dir.is_finite() || dir.length_squared() < 1e-12 {
+            return None;
+        }
+        let (t_enter, t_exit, normal_enter, normal_exit) = ray_box(origin, dir, dims)?;
+        if t_exit < 0.0 {
+            return None; // canvas is entirely behind the camera
+        }
+        // Enter at the box, or start where we are if the eye is already inside
+        // it. The nudge keeps the first `floor` off an exact face plane.
+        let t_start = t_enter.max(0.0) + 1e-4;
+        let max_t = (t_exit - t_start).max(0.0);
 
         // Amanatides–Woo voxel traversal. Unlike fixed-step sampling, this lands
         // on every cell the ray crosses in order and tracks exactly which face
         // we entered through, so the placement normal is always correct (no more
         // voxels embedded in the surface they were placed against).
-        let o = origin.to_array();
+        let o = (origin + dir * t_start).to_array();
         let d = dir.to_array();
         let mut ip = [o[0].floor() as i32, o[1].floor() as i32, o[2].floor() as i32];
         let mut step = [0i32; 3];
@@ -1751,11 +1775,12 @@ impl State {
             }
         }
 
-        // Normal of the face we entered the current cell through. Zero until the
-        // first boundary crossing (i.e. while still in the origin's own cell).
-        let mut normal = [0.0f32; 3];
+        // Normal of the face we entered the current cell through: the box face
+        // we came in by, or zero when the eye was already inside the box and we
+        // are still in its own cell.
+        let mut normal = if t_enter > 0.0 { normal_enter } else { [0.0f32; 3] };
         let mut t = 0.0;
-        while t < max_dist {
+        while t <= max_t {
             if ip[0] >= 0 && ip[1] >= 0 && ip[2] >= 0 {
                 let solid = self
                     .chunk
@@ -1786,55 +1811,11 @@ impl State {
             normal[axis] = -step[axis] as f32;
         }
 
-        // If no voxel was hit, check for intersection with the world's bounding box boundaries.
-        // This allows building from the limits when the world is empty.
-        let dims = [self.chunk.width as i32, self.chunk.height as i32, self.chunk.depth as i32];
-
-        let mut t_min = f32::NEG_INFINITY;
-        let mut t_max = f32::INFINITY;
-        let mut hit_normal_near = [0.0; 3];
-        let mut hit_normal_far = [0.0; 3];
-
-        let bounds_min = [0.0, 0.0, 0.0];
-        let bounds_max = [dims[0] as f32, dims[1] as f32, dims[2] as f32];
-        let origin_arr = [origin.x, origin.y, origin.z];
-        let dir_arr = [dir.x, dir.y, dir.z];
-
-        for i in 0..3 {
-            if dir_arr[i].abs() > 1e-6 {
-                let t1 = (bounds_min[i] - origin_arr[i]) / dir_arr[i];
-                let t2 = (bounds_max[i] - origin_arr[i]) / dir_arr[i];
-
-                let (t_near, t_far, normal_near, normal_far) = if t1 < t2 { 
-                    (t1, t2, -1.0, 1.0) 
-                } else { 
-                    (t2, t1, 1.0, -1.0) 
-                };
-
-                if t_near > t_min {
-                    t_min = t_near;
-                    hit_normal_near = [0.0; 3];
-                    hit_normal_near[i] = normal_near;
-                }
-                if t_far < t_max {
-                    t_max = t_far;
-                    hit_normal_far = [0.0; 3];
-                    hit_normal_far[i] = normal_far;
-                }
-            } else if origin_arr[i] < bounds_min[i] || origin_arr[i] > bounds_max[i] {
-                return None;
-            }
-        }
-
-        // Use t_max (farthest) if it's in front of us and within range,
-        // otherwise fall back to t_min (nearest).
-        let (t_hit, hit_normal) = if t_max > 0.0 && t_max < max_dist {
-            (t_max, hit_normal_far)
-        } else if t_min > 0.0 && t_min < t_max && t_min < max_dist {
-            (t_min, hit_normal_near)
-        } else {
-            return None;
-        };
+        // No voxel along the way, so fall back to the canvas boundary itself —
+        // that is what lets you build from the limits while the world is empty.
+        // The far face is used so the first voxel lands on the inside of the
+        // wall being looked at rather than on the pane nearest the camera.
+        let (t_hit, hit_normal) = (t_exit, normal_exit);
 
         let p = origin + dir * t_hit;
         let mut ip = [
@@ -1914,7 +1895,7 @@ impl State {
 
         use wgpu::util::DeviceExt;
         let line_vertices = bounding_box_lines(&self.chunk);
-        self.num_line_indices = line_vertices.len() as u32;
+        self.num_line_vertices = line_vertices.len() as u32;
         self.line_vertex_buffer = self.device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
                 label: Some("Line Vertex Buffer"),
@@ -1925,26 +1906,38 @@ impl State {
         self.remesh();
     }
 
+    /// Marks the mesh out of date. The rebuild itself happens once per frame in
+    /// [`flush_mesh`](Self::flush_mesh) — a fast drag delivers several cursor
+    /// events per frame, and re-meshing the whole canvas on each of them is what
+    /// made large canvases unusable.
     fn remesh(&mut self) {
-        let (mesh_vertices, mesh_indices) = crate::render::mesh_chunk(&self.chunk, &self.palette);
+        self.mesh_dirty = true;
+    }
 
-        use wgpu::util::DeviceExt;
-        self.vertex_buffer = self.device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
-                label: Some("Vertex Buffer"),
-                contents: bytemuck::cast_slice(&mesh_vertices),
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            }
+    /// Rebuilds the voxel mesh if anything has changed since the last frame.
+    fn flush_mesh(&mut self) {
+        if !self.mesh_dirty {
+            return;
+        }
+        self.mesh_dirty = false;
+        let (vertices, indices) = crate::render::mesh_chunk(&self.chunk, &self.palette);
+        self.num_indices = indices.len() as u32;
+        upload_growable(
+            &self.device,
+            &self.queue,
+            &mut self.vertex_buffer,
+            bytemuck::cast_slice(&vertices),
+            wgpu::BufferUsages::VERTEX,
+            "Vertex Buffer",
         );
-
-        self.index_buffer = self.device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
-                label: Some("Index Buffer"),
-                contents: bytemuck::cast_slice(&mesh_indices),
-                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-            }
+        upload_growable(
+            &self.device,
+            &self.queue,
+            &mut self.index_buffer,
+            bytemuck::cast_slice(&indices),
+            wgpu::BufferUsages::INDEX,
+            "Index Buffer",
         );
-        self.num_indices = mesh_indices.len() as u32;
     }
 
     /// Save to the current path without prompting, falling back to `Save As` the
@@ -2060,6 +2053,10 @@ impl State {
         });
         self.egui_state
             .handle_platform_output(&self.window, full_output.platform_output);
+        // After the UI, so a button that recolors or undoes lands on this frame,
+        // and before the passes that draw the mesh.
+        self.flush_mesh();
+
         let paint_jobs =
             egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
 
@@ -2124,7 +2121,7 @@ impl State {
             // Draw bounding box
             render_pass.set_pipeline(&self.line_pipeline);
             render_pass.set_vertex_buffer(0, self.line_vertex_buffer.slice(..));
-            render_pass.draw(0..self.num_line_indices, 0..1);
+            render_pass.draw(0..self.num_line_vertices, 0..1);
 
             // Draw the hover/rectangle overlay on top of the scene.
             if self.num_overlay_vertices > 0 {
@@ -2409,6 +2406,95 @@ impl State {
             });
         });
     }
+}
+
+/// An empty buffer that [`upload_growable`] will size on first write.
+fn new_growable_buffer(device: &wgpu::Device, label: &str, usage: wgpu::BufferUsages) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: 0,
+        usage: usage | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+/// Writes `data` into `buffer`, reallocating only when it no longer fits.
+///
+/// The mesh buffers used to be recreated from scratch on every edit, which at a
+/// 256³ canvas meant discarding and re-uploading ~42 MB per mouse-move. Capacity
+/// doubles on growth so a model being built up doesn't reallocate each time.
+fn upload_growable(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    buffer: &mut wgpu::Buffer,
+    data: &[u8],
+    usage: wgpu::BufferUsages,
+    label: &str,
+) {
+    if data.is_empty() {
+        return; // Nothing to draw; the caller's count is already 0.
+    }
+    if data.len() as u64 > buffer.size() {
+        *buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: (data.len() as u64 * 2).next_power_of_two(),
+            usage: usage | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+    }
+    queue.write_buffer(buffer, 0, data);
+}
+
+/// Slab test of a ray against the canvas's axis-aligned box, which spans
+/// `0..dims` on each axis.
+///
+/// Returns `(t_enter, t_exit, normal_enter, normal_exit)`: the distances along
+/// `dir` to the near and far faces, and each face's outward normal. Both `t`s
+/// may be negative when the box is behind the ray. `None` if the ray misses the
+/// box altogether.
+fn ray_box(
+    origin: glam::Vec3,
+    dir: glam::Vec3,
+    dims: [i32; 3],
+) -> Option<(f32, f32, [f32; 3], [f32; 3])> {
+    let o = origin.to_array();
+    let d = dir.to_array();
+    let mut t_enter = f32::NEG_INFINITY;
+    let mut t_exit = f32::INFINITY;
+    let mut normal_enter = [0.0f32; 3];
+    let mut normal_exit = [0.0f32; 3];
+
+    for i in 0..3 {
+        let (lo, hi) = (0.0, dims[i] as f32);
+        if d[i].abs() <= 1e-6 {
+            // Parallel to this pair of planes: either inside the slab for the
+            // whole ray, or never.
+            if o[i] < lo || o[i] > hi {
+                return None;
+            }
+            continue;
+        }
+        let t1 = (lo - o[i]) / d[i];
+        let t2 = (hi - o[i]) / d[i];
+        let (near, far, n_near, n_far) = if t1 < t2 {
+            (t1, t2, -1.0, 1.0)
+        } else {
+            (t2, t1, 1.0, -1.0)
+        };
+        if near > t_enter {
+            t_enter = near;
+            normal_enter = [0.0; 3];
+            normal_enter[i] = n_near;
+        }
+        if far < t_exit {
+            t_exit = far;
+            normal_exit = [0.0; 3];
+            normal_exit[i] = n_far;
+        }
+    }
+
+    // The slabs overlap only if the last entry precedes the first exit.
+    (t_enter <= t_exit).then_some((t_enter, t_exit, normal_enter, normal_exit))
 }
 
 /// Selects a text field's whole contents when focus arrives from the keyboard
@@ -2737,4 +2823,60 @@ fn push_overlay_quad(
     verts.push(p(0.0, 0.0));
     verts.push(p(1.0, 1.0));
     verts.push(p(0.0, 1.0));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ray_box;
+    use glam::Vec3;
+
+    const DIMS: [i32; 3] = [16, 16, 16];
+
+    /// The reach of a cursor ray must not depend on how far the camera has been
+    /// zoomed out: the box is found at 500 units away just as it is at 5.
+    #[test]
+    fn box_is_found_from_any_distance() {
+        for eye_z in [20.0, 100.0, 500.0, 10_000.0] {
+            let (t_enter, t_exit, n_enter, n_exit) =
+                ray_box(Vec3::new(8.0, 8.0, eye_z), Vec3::new(0.0, 0.0, -1.0), DIMS)
+                    .expect("head-on ray must hit the box");
+            assert_eq!(t_enter, eye_z - 16.0);
+            assert_eq!(t_exit, eye_z);
+            // Entered through the +Z face, leaves through the -Z one.
+            assert_eq!(n_enter, [0.0, 0.0, 1.0]);
+            assert_eq!(n_exit, [0.0, 0.0, -1.0]);
+        }
+    }
+
+    #[test]
+    fn ray_parallel_to_and_outside_a_slab_misses() {
+        assert!(ray_box(Vec3::new(100.0, 8.0, 500.0), Vec3::new(0.0, 0.0, -1.0), DIMS).is_none());
+    }
+
+    /// Slabs that never overlap: the ray passes the box by, so the last entry
+    /// comes after the first exit.
+    #[test]
+    fn ray_missing_diagonally_is_rejected() {
+        assert!(ray_box(Vec3::new(-10.0, -1.0, 8.0), Vec3::new(1.0, 0.01, 0.0), DIMS).is_none());
+    }
+
+    /// An eye inside the box gives a negative entry distance, which `raycast`
+    /// clamps to zero so traversal starts at the eye's own cell.
+    #[test]
+    fn eye_inside_the_box_enters_behind_itself() {
+        let (t_enter, t_exit, _, n_exit) =
+            ray_box(Vec3::new(8.0, 8.0, 8.0), Vec3::new(0.0, 0.0, 1.0), DIMS).unwrap();
+        assert_eq!(t_enter, -8.0);
+        assert_eq!(t_exit, 8.0);
+        assert_eq!(n_exit, [0.0, 0.0, 1.0]);
+    }
+
+    /// Looking directly away from the canvas: both distances are negative, and
+    /// `raycast` turns that into "no hit".
+    #[test]
+    fn box_behind_the_camera_yields_negative_distances() {
+        let (_, t_exit, _, _) =
+            ray_box(Vec3::new(8.0, 8.0, 500.0), Vec3::new(0.0, 0.0, 1.0), DIMS).unwrap();
+        assert!(t_exit < 0.0, "t_exit = {t_exit}");
+    }
 }
