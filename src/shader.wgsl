@@ -36,7 +36,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let light_dir = normalize(vec3<f32>(0.5, 1.0, 0.3));
     let ambient = 0.3;
     let diffuse = max(dot(normalize(in.normal), light_dir), 0.0);
-    let lighting = ambient + diffuse;
+    // Clamped: ambient + a fully lit face reaches 1.3, which blows out bright
+    // palette colors instead of shading them.
+    let lighting = min(ambient + diffuse, 1.0);
     
     return vec4<f32>(in.color * lighting, 1.0);
 }

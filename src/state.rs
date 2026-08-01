@@ -820,7 +820,13 @@ impl State {
                 let pressed = *state == winit::event::ElementState::Pressed;
                 let ctrl = self.modifiers.control_key();
 
-                if pressed {
+                // Bare letters and digits are tool/color shortcuts, but they are
+                // also ordinary text. Typing `8` into a canvas-extent field must
+                // not also jump the palette to slot 8, so they only fire when
+                // egui isn't holding the keyboard. Ctrl-chords are unambiguous
+                // and stay live either way.
+                let typing = self.egui_ctx.wants_keyboard_input();
+                if pressed && !(typing && !ctrl) {
                     match key {
                         KeyCode::Digit1 if !*repeat => { self.current_color_index = 1; return true; }
                         KeyCode::Digit2 if !*repeat => { self.current_color_index = 2; return true; }
@@ -868,7 +874,14 @@ impl State {
                 self.camera_controller.process_events(event)
             }
             WindowEvent::MouseWheel { .. } => {
-                self.camera_controller.process_events(event)
+                let consumed = self.camera_controller.process_events(event);
+                // Zooming moves the camera without moving the cursor, so the
+                // ray now points somewhere else; without this the highlight
+                // stays stuck on the previously hovered face until the mouse
+                // is jiggled. The camera has already been updated by
+                // `process_events`, so the new ray is the one we want.
+                self.update_overlay();
+                consumed
             }
             _ => false,
         }
@@ -1146,35 +1159,43 @@ impl State {
 
         // Iterative flood fill. Mutate the chunk directly and record each change
         // so we can remesh just once at the end.
-        let mut stack = vec![[sx, sy, sz]];
-        let mut changed = false;
-        while let Some([x, y, z]) = stack.pop() {
-            let Some(v) = self.chunk.get(x, y, z) else { continue };
-            if v.is_empty() || v.color_index != target {
-                continue;
+        //
+        // A cell is recolored as it is *pushed*, not as it is popped, so it can
+        // never be queued twice. Deferring that let every solid neighbour push
+        // its own copy: a filled 256³ region peaked at ~6x the cell count on the
+        // stack, around 2.4 GB.
+        let recolored = Voxel { color_index: new_color };
+        // Claiming a cell means recoloring it now, which also removes it from
+        // `target` and so from any later neighbour test.
+        let claim = |s: &mut Self, x: usize, y: usize, z: usize| {
+            let old = *s.chunk.get(x, y, z)?;
+            if old.color_index != target {
+                return None;
             }
-            let old = *v;
-            self.chunk.set(x, y, z, Voxel { color_index: new_color });
-            self.history.record(VoxelEdit {
-                x,
-                y,
-                z,
-                old,
-                new: Voxel { color_index: new_color },
-            });
-            changed = true;
+            s.chunk.set(x, y, z, recolored);
+            s.history.record(VoxelEdit { x, y, z, old, new: recolored });
+            Some([x, y, z])
+        };
 
-            if x + 1 < cw { stack.push([x + 1, y, z]); }
-            if x > 0 { stack.push([x - 1, y, z]); }
-            if y + 1 < ch { stack.push([x, y + 1, z]); }
-            if y > 0 { stack.push([x, y - 1, z]); }
-            if z + 1 < cd { stack.push([x, y, z + 1]); }
-            if z > 0 { stack.push([x, y, z - 1]); }
+        let mut stack = Vec::new();
+        stack.extend(claim(self, sx, sy, sz));
+        while let Some([x, y, z]) = stack.pop() {
+            let neighbors = [
+                (x + 1, y, z, x + 1 < cw),
+                (x.wrapping_sub(1), y, z, x > 0),
+                (x, y + 1, z, y + 1 < ch),
+                (x, y.wrapping_sub(1), z, y > 0),
+                (x, y, z + 1, z + 1 < cd),
+                (x, y, z.wrapping_sub(1), z > 0),
+            ];
+            for (nx, ny, nz, in_bounds) in neighbors {
+                if in_bounds {
+                    stack.extend(claim(self, nx, ny, nz));
+                }
+            }
         }
 
-        if changed {
-            self.remesh();
-        }
+        self.remesh();
     }
 
     fn handle_extrude_click(&mut self, erase: bool) {
@@ -1182,6 +1203,11 @@ impl State {
         let ray_origin = self.camera.eye;
 
         if let Some((pos, normal, _)) = self.raycast(ray_origin, ray_dir) {
+            // A boundary-only hit reports a cell just outside the canvas, whose
+            // negative coordinate would wrap to a huge `usize`.
+            if pos[0] < 0 || pos[1] < 0 || pos[2] < 0 {
+                return;
+            }
             if let Some(v) = self.chunk.get(pos[0] as usize, pos[1] as usize, pos[2] as usize) {
                 if !v.is_empty() {
                     let normal_i = [normal[0] as i32, normal[1] as i32, normal[2] as i32];
@@ -1360,12 +1386,21 @@ impl State {
                 .map(|v| v.color_index)
                 .unwrap_or(0);
             voxels.push((curr, color));
-            for (axis, delta) in [(0, 1), (0, -1), (1, 1), (1, -1), (2, 1), (2, -1)] {
-                let mut next = curr;
-                next[axis] += delta;
-                if !visited.contains(&next) && self.solid_at(next) {
-                    visited.insert(next);
-                    stack.push(next);
+            // 26-connected: voxels meeting only at an edge or a corner are part
+            // of the same object. Face adjacency alone splits anything built on
+            // a diagonal into pieces that slide independently.
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        if (dx, dy, dz) == (0, 0, 0) {
+                            continue;
+                        }
+                        let next = [curr[0] + dx, curr[1] + dy, curr[2] + dz];
+                        if !visited.contains(&next) && self.solid_at(next) {
+                            visited.insert(next);
+                            stack.push(next);
+                        }
+                    }
                 }
             }
         }
@@ -1704,7 +1739,7 @@ impl State {
 
     fn redo(&mut self) {
         if let Some(group) = self.history.redo() {
-            for e in &group {
+            for e in group.iter() {
                 self.chunk.set(e.x, e.y, e.z, e.new);
             }
             self.remesh();
