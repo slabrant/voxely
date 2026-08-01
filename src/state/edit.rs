@@ -495,7 +495,7 @@ impl State {
                 return None;
             }
             s.chunk.set(x, y, z, recolored);
-            s.history.record(VoxelEdit { x, y, z, old, new: recolored });
+            s.history.record(VoxelEdit { x: x as u16, y: y as u16, z: z as u16, old, new: recolored });
             Some([x, y, z])
         };
 
@@ -862,9 +862,9 @@ impl State {
         }
 
         if is_drag {
-            self.history.record_continuous(VoxelEdit { x: xu, y: yu, z: zu, old, new: voxel });
+            self.history.record_continuous(VoxelEdit { x: xu as u16, y: yu as u16, z: zu as u16, old, new: voxel });
         } else {
-            self.history.record(VoxelEdit { x: xu, y: yu, z: zu, old, new: voxel });
+            self.history.record(VoxelEdit { x: xu as u16, y: yu as u16, z: zu as u16, old, new: voxel });
         }
         true
     }

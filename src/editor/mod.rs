@@ -12,11 +12,16 @@ const MAX_UNDO_DEPTH: usize = 256;
 pub type EditGroup = Rc<Vec<VoxelEdit>>;
 
 /// A single reversible change to one voxel.
+///
+/// Coordinates are `u16` rather than `usize` purely for size: a full-canvas
+/// flood fill on a 250³ model records 15.6M of these, and at three `usize`s
+/// each that group alone was ~500 MB of undo history. `MAX_CHUNK_SIZE` is 256,
+/// so `u16` leaves room to spare while cutting the struct to 8 bytes.
 #[derive(Clone, Copy)]
 pub struct VoxelEdit {
-    pub x: usize,
-    pub y: usize,
-    pub z: usize,
+    pub x: u16,
+    pub y: u16,
+    pub z: u16,
     pub old: Voxel,
     pub new: Voxel,
 }
@@ -115,6 +120,13 @@ impl EditHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `VoxelEdit` is deliberately small -- see its doc comment. A regression
+    /// here quietly multiplies the memory a large fill costs.
+    #[test]
+    fn voxel_edit_stays_eight_bytes() {
+        assert_eq!(std::mem::size_of::<VoxelEdit>(), 8);
+    }
 
     fn edit(old: u8, new: u8) -> VoxelEdit {
         VoxelEdit {

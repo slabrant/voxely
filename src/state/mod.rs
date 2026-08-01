@@ -232,7 +232,7 @@ impl State {
             // Reverse order so coordinates touched more than once in a single
             // gesture land back on their original value.
             for e in group.iter().rev() {
-                self.chunk.set(e.x, e.y, e.z, e.old);
+                self.chunk.set(e.x as usize, e.y as usize, e.z as usize, e.old);
             }
             self.remesh();
             println!("Undo");
@@ -242,7 +242,7 @@ impl State {
     pub(super) fn redo(&mut self) {
         if let Some(group) = self.history.redo() {
             for e in group.iter() {
-                self.chunk.set(e.x, e.y, e.z, e.new);
+                self.chunk.set(e.x as usize, e.y as usize, e.z as usize, e.new);
             }
             self.remesh();
             println!("Redo");
